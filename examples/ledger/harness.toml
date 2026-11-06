@@ -1,0 +1,9 @@
+[[implementation]]
+name = "original"
+build = ["go", "build", "-C", "drivers/go", "-overlay", "overlay-original.json", "-o", "{build}/original", "."]
+run = ["{build}/original"]
+
+[[implementation]]
+name = "reference"
+build = ["ignite", "build", "drivers/ignite/driver.ignite", "--out", "{build}/reference"]
+run = ["{build}/reference/bin/ledger-reference"]

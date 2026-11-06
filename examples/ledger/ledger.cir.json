@@ -1,0 +1,2635 @@
+{
+  "format": "cir/1",
+  "name": "ledger",
+  "reader": {
+    "language": "go",
+    "name": "codespec-read-go",
+    "version": "0.0.0"
+  },
+  "doc": "Package ledger takes, pays, ships and cancels customer orders. It keeps its orders as values in a\nmap and its events in a slice the caller drains after each call: no channel, no goroutine and no\npointer shared between owners.",
+  "types": [
+    {
+      "k": "newtype",
+      "name": "OrderID",
+      "exported": true,
+      "under": {
+        "k": "string"
+      },
+      "pos": "ledger.go:11"
+    },
+    {
+      "k": "enum",
+      "name": "Status",
+      "exported": true,
+      "under": {
+        "k": "string"
+      },
+      "variants": [
+        {
+          "name": "Pending",
+          "value": {
+            "k": "lit",
+            "value": "\"pending\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        },
+        {
+          "name": "Paid",
+          "value": {
+            "k": "lit",
+            "value": "\"paid\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        },
+        {
+          "name": "Shipped",
+          "value": {
+            "k": "lit",
+            "value": "\"shipped\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        },
+        {
+          "name": "Cancelled",
+          "value": {
+            "k": "lit",
+            "value": "\"cancelled\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        }
+      ],
+      "pos": "ledger.go:13"
+    },
+    {
+      "k": "struct",
+      "name": "Order",
+      "exported": true,
+      "fields": [
+        {
+          "name": "ID",
+          "t": {
+            "k": "named",
+            "name": "OrderID"
+          }
+        },
+        {
+          "name": "Customer",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "Total",
+          "t": {
+            "k": "int",
+            "width": "64",
+            "signed": true
+          }
+        },
+        {
+          "name": "Status",
+          "t": {
+            "k": "named",
+            "name": "Status"
+          }
+        },
+        {
+          "name": "Tracking",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "Gift",
+          "t": {
+            "k": "bool"
+          }
+        }
+      ],
+      "pos": "ledger.go:22"
+    },
+    {
+      "k": "struct",
+      "name": "ErrWrongState",
+      "exported": true,
+      "fields": [
+        {
+          "name": "Status",
+          "t": {
+            "k": "named",
+            "name": "Status"
+          }
+        }
+      ],
+      "pos": "ledger.go:33"
+    },
+    {
+      "k": "enum",
+      "name": "EventKind",
+      "exported": true,
+      "under": {
+        "k": "string"
+      },
+      "variants": [
+        {
+          "name": "OrderPlaced",
+          "value": {
+            "k": "lit",
+            "value": "\"OrderPlaced\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        },
+        {
+          "name": "OrderPaid",
+          "value": {
+            "k": "lit",
+            "value": "\"OrderPaid\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        },
+        {
+          "name": "OrderShipped",
+          "value": {
+            "k": "lit",
+            "value": "\"OrderShipped\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        },
+        {
+          "name": "OrderCancelled",
+          "value": {
+            "k": "lit",
+            "value": "\"OrderCancelled\"",
+            "t": {
+              "k": "string"
+            }
+          }
+        }
+      ],
+      "pos": "ledger.go:39"
+    },
+    {
+      "k": "struct",
+      "name": "Event",
+      "exported": true,
+      "fields": [
+        {
+          "name": "Kind",
+          "t": {
+            "k": "named",
+            "name": "EventKind"
+          }
+        },
+        {
+          "name": "ID",
+          "t": {
+            "k": "named",
+            "name": "OrderID"
+          }
+        },
+        {
+          "name": "Customer",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "Total",
+          "t": {
+            "k": "int",
+            "width": "64",
+            "signed": true
+          }
+        },
+        {
+          "name": "Tracking",
+          "t": {
+            "k": "string"
+          }
+        }
+      ],
+      "doc": "Event is one change of the ledger. Kind names it; the fields it does not use are empty.",
+      "pos": "ledger.go:49"
+    },
+    {
+      "k": "struct",
+      "name": "Ledger",
+      "exported": true,
+      "fields": [
+        {
+          "name": "orders",
+          "t": {
+            "k": "map",
+            "key": {
+              "k": "named",
+              "name": "OrderID"
+            },
+            "elem": {
+              "k": "named",
+              "name": "Order"
+            }
+          }
+        },
+        {
+          "name": "events",
+          "t": {
+            "k": "slice",
+            "elem": {
+              "k": "named",
+              "name": "Event"
+            }
+          }
+        },
+        {
+          "name": "seq",
+          "t": {
+            "k": "int",
+            "width": "platform",
+            "signed": true
+          }
+        }
+      ],
+      "pos": "ledger.go:57"
+    }
+  ],
+  "errors": [
+    {
+      "name": "ErrInvalidTotal",
+      "message": "total must be positive",
+      "pos": "ledger.go:31"
+    }
+  ],
+  "funcs": [
+    {
+      "name": "Error",
+      "exported": true,
+      "recv": {
+        "name": "e",
+        "t": {
+          "k": "named",
+          "name": "ErrWrongState"
+        }
+      },
+      "params": [],
+      "results": [
+        {
+          "k": "string"
+        }
+      ],
+      "body": [
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "intrinsic",
+              "name": "sprintf",
+              "args": [
+                {
+                  "k": "lit",
+                  "value": "\"order is %s\"",
+                  "t": {
+                    "k": "string"
+                  }
+                },
+                {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "e",
+                    "t": {
+                      "k": "named",
+                      "name": "ErrWrongState"
+                    }
+                  },
+                  "name": "Status",
+                  "t": {
+                    "k": "named",
+                    "name": "Status"
+                  }
+                }
+              ],
+              "t": {
+                "k": "string"
+              }
+            }
+          ],
+          "pos": "ledger.go:37"
+        }
+      ],
+      "pos": "ledger.go:37"
+    },
+    {
+      "name": "New",
+      "exported": true,
+      "params": [],
+      "results": [
+        {
+          "k": "named",
+          "name": "Ledger"
+        }
+      ],
+      "body": [
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "struct",
+              "name": "Ledger",
+              "fields": [
+                {
+                  "name": "orders",
+                  "value": {
+                    "k": "make",
+                    "t": {
+                      "k": "map",
+                      "key": {
+                        "k": "named",
+                        "name": "OrderID"
+                      },
+                      "elem": {
+                        "k": "named",
+                        "name": "Order"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "events",
+                  "value": {
+                    "k": "make",
+                    "t": {
+                      "k": "slice",
+                      "elem": {
+                        "k": "named",
+                        "name": "Event"
+                      }
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "named",
+                "name": "Ledger"
+              }
+            }
+          ],
+          "pos": "ledger.go:64"
+        }
+      ],
+      "pos": "ledger.go:63"
+    },
+    {
+      "name": "Place",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "customer",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "total",
+          "t": {
+            "k": "int",
+            "width": "64",
+            "signed": true
+          }
+        },
+        {
+          "name": "gift",
+          "t": {
+            "k": "bool"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "named",
+          "name": "OrderID"
+        },
+        {
+          "k": "error"
+        }
+      ],
+      "body": [
+        {
+          "k": "if",
+          "cond": {
+            "k": "binop",
+            "op": "<=",
+            "x": {
+              "k": "var",
+              "name": "total",
+              "t": {
+                "k": "int",
+                "width": "64",
+                "signed": true
+              }
+            },
+            "y": {
+              "k": "lit",
+              "value": "0",
+              "t": {
+                "k": "int",
+                "width": "64",
+                "signed": true
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "lit",
+                  "value": "\"\"",
+                  "t": {
+                    "k": "named",
+                    "name": "OrderID"
+                  }
+                },
+                {
+                  "k": "errvar",
+                  "name": "ErrInvalidTotal",
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:69"
+            }
+          ],
+          "pos": "ledger.go:68"
+        },
+        {
+          "k": "incr",
+          "x": {
+            "k": "field",
+            "x": {
+              "k": "var",
+              "name": "l",
+              "t": {
+                "k": "ptr",
+                "elem": {
+                  "k": "named",
+                  "name": "Ledger"
+                }
+              }
+            },
+            "name": "seq",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          },
+          "pos": "ledger.go:71"
+        },
+        {
+          "k": "let",
+          "names": [
+            "id"
+          ],
+          "rhs": [
+            {
+              "k": "conv",
+              "name": "OrderID",
+              "x": {
+                "k": "intrinsic",
+                "name": "sprintf",
+                "args": [
+                  {
+                    "k": "lit",
+                    "value": "\"o-%d\"",
+                    "t": {
+                      "k": "string"
+                    }
+                  },
+                  {
+                    "k": "field",
+                    "x": {
+                      "k": "var",
+                      "name": "l",
+                      "t": {
+                        "k": "ptr",
+                        "elem": {
+                          "k": "named",
+                          "name": "Ledger"
+                        }
+                      }
+                    },
+                    "name": "seq",
+                    "t": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                ],
+                "t": {
+                  "k": "string"
+                }
+              },
+              "t": {
+                "k": "named",
+                "name": "OrderID"
+              }
+            }
+          ],
+          "pos": "ledger.go:72"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "struct",
+              "name": "Order",
+              "fields": [
+                {
+                  "name": "ID",
+                  "value": {
+                    "k": "var",
+                    "name": "id",
+                    "t": {
+                      "k": "named",
+                      "name": "OrderID"
+                    }
+                  }
+                },
+                {
+                  "name": "Customer",
+                  "value": {
+                    "k": "var",
+                    "name": "customer",
+                    "t": {
+                      "k": "string"
+                    }
+                  }
+                },
+                {
+                  "name": "Total",
+                  "value": {
+                    "k": "var",
+                    "name": "total",
+                    "t": {
+                      "k": "int",
+                      "width": "64",
+                      "signed": true
+                    }
+                  }
+                },
+                {
+                  "name": "Status",
+                  "value": {
+                    "k": "const",
+                    "name": "Pending",
+                    "t": {
+                      "k": "named",
+                      "name": "Status"
+                    }
+                  }
+                },
+                {
+                  "name": "Gift",
+                  "value": {
+                    "k": "var",
+                    "name": "gift",
+                    "t": {
+                      "k": "bool"
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "pos": "ledger.go:73"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "l",
+                "t": {
+                  "k": "ptr",
+                  "elem": {
+                    "k": "named",
+                    "name": "Ledger"
+                  }
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "l",
+                    "t": {
+                      "k": "ptr",
+                      "elem": {
+                        "k": "named",
+                        "name": "Ledger"
+                      }
+                    }
+                  },
+                  "name": "events",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "named",
+                      "name": "Event"
+                    }
+                  }
+                },
+                {
+                  "k": "struct",
+                  "name": "Event",
+                  "fields": [
+                    {
+                      "name": "Kind",
+                      "value": {
+                        "k": "const",
+                        "name": "OrderPlaced",
+                        "t": {
+                          "k": "named",
+                          "name": "EventKind"
+                        }
+                      }
+                    },
+                    {
+                      "name": "ID",
+                      "value": {
+                        "k": "var",
+                        "name": "id",
+                        "t": {
+                          "k": "named",
+                          "name": "OrderID"
+                        }
+                      }
+                    },
+                    {
+                      "name": "Customer",
+                      "value": {
+                        "k": "var",
+                        "name": "customer",
+                        "t": {
+                          "k": "string"
+                        }
+                      }
+                    },
+                    {
+                      "name": "Total",
+                      "value": {
+                        "k": "var",
+                        "name": "total",
+                        "t": {
+                          "k": "int",
+                          "width": "64",
+                          "signed": true
+                        }
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "named",
+                    "name": "Event"
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:74"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "id",
+              "t": {
+                "k": "named",
+                "name": "OrderID"
+              }
+            },
+            {
+              "k": "nil",
+              "t": {
+                "k": "error"
+              }
+            }
+          ],
+          "pos": "ledger.go:75"
+        }
+      ],
+      "pos": "ledger.go:67"
+    },
+    {
+      "name": "Pay",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "id",
+          "t": {
+            "k": "named",
+            "name": "OrderID"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "error"
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "o",
+            "ok"
+          ],
+          "rhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "tuple",
+                "elems": [
+                  {
+                    "k": "named",
+                    "name": "Order"
+                  },
+                  {
+                    "k": "bool"
+                  }
+                ]
+              }
+            }
+          ],
+          "pos": "ledger.go:79"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "unop",
+            "op": "!",
+            "x": {
+              "k": "var",
+              "name": "ok",
+              "t": {
+                "k": "bool"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "intrinsic",
+                  "name": "errorf",
+                  "args": [
+                    {
+                      "k": "lit",
+                      "value": "\"no order %s\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    },
+                    {
+                      "k": "var",
+                      "name": "id",
+                      "t": {
+                        "k": "named",
+                        "name": "OrderID"
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:81"
+            }
+          ],
+          "pos": "ledger.go:80"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "binop",
+            "op": "!=",
+            "x": {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "o",
+                "t": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              },
+              "name": "Status",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            },
+            "y": {
+              "k": "const",
+              "name": "Pending",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "to_error",
+                  "x": {
+                    "k": "struct",
+                    "name": "ErrWrongState",
+                    "fields": [
+                      {
+                        "name": "Status",
+                        "value": {
+                          "k": "field",
+                          "x": {
+                            "k": "var",
+                            "name": "o",
+                            "t": {
+                              "k": "named",
+                              "name": "Order"
+                            }
+                          },
+                          "name": "Status",
+                          "t": {
+                            "k": "named",
+                            "name": "Status"
+                          }
+                        }
+                      }
+                    ],
+                    "t": {
+                      "k": "named",
+                      "name": "ErrWrongState"
+                    }
+                  },
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:84"
+            }
+          ],
+          "pos": "ledger.go:83"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "o",
+                "t": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              },
+              "name": "Status",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "const",
+              "name": "Paid",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ],
+          "pos": "ledger.go:86"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "var",
+              "name": "o",
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "pos": "ledger.go:87"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "l",
+                "t": {
+                  "k": "ptr",
+                  "elem": {
+                    "k": "named",
+                    "name": "Ledger"
+                  }
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "l",
+                    "t": {
+                      "k": "ptr",
+                      "elem": {
+                        "k": "named",
+                        "name": "Ledger"
+                      }
+                    }
+                  },
+                  "name": "events",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "named",
+                      "name": "Event"
+                    }
+                  }
+                },
+                {
+                  "k": "struct",
+                  "name": "Event",
+                  "fields": [
+                    {
+                      "name": "Kind",
+                      "value": {
+                        "k": "const",
+                        "name": "OrderPaid",
+                        "t": {
+                          "k": "named",
+                          "name": "EventKind"
+                        }
+                      }
+                    },
+                    {
+                      "name": "ID",
+                      "value": {
+                        "k": "var",
+                        "name": "id",
+                        "t": {
+                          "k": "named",
+                          "name": "OrderID"
+                        }
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "named",
+                    "name": "Event"
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:88"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "nil",
+              "t": {
+                "k": "error"
+              }
+            }
+          ],
+          "pos": "ledger.go:89"
+        }
+      ],
+      "pos": "ledger.go:78"
+    },
+    {
+      "name": "Ship",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "id",
+          "t": {
+            "k": "named",
+            "name": "OrderID"
+          }
+        },
+        {
+          "name": "tracking",
+          "t": {
+            "k": "string"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "error"
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "o",
+            "ok"
+          ],
+          "rhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "tuple",
+                "elems": [
+                  {
+                    "k": "named",
+                    "name": "Order"
+                  },
+                  {
+                    "k": "bool"
+                  }
+                ]
+              }
+            }
+          ],
+          "pos": "ledger.go:93"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "unop",
+            "op": "!",
+            "x": {
+              "k": "var",
+              "name": "ok",
+              "t": {
+                "k": "bool"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "intrinsic",
+                  "name": "errorf",
+                  "args": [
+                    {
+                      "k": "lit",
+                      "value": "\"no order %s\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    },
+                    {
+                      "k": "var",
+                      "name": "id",
+                      "t": {
+                        "k": "named",
+                        "name": "OrderID"
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:95"
+            }
+          ],
+          "pos": "ledger.go:94"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "binop",
+            "op": "!=",
+            "x": {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "o",
+                "t": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              },
+              "name": "Status",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            },
+            "y": {
+              "k": "const",
+              "name": "Paid",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "to_error",
+                  "x": {
+                    "k": "struct",
+                    "name": "ErrWrongState",
+                    "fields": [
+                      {
+                        "name": "Status",
+                        "value": {
+                          "k": "field",
+                          "x": {
+                            "k": "var",
+                            "name": "o",
+                            "t": {
+                              "k": "named",
+                              "name": "Order"
+                            }
+                          },
+                          "name": "Status",
+                          "t": {
+                            "k": "named",
+                            "name": "Status"
+                          }
+                        }
+                      }
+                    ],
+                    "t": {
+                      "k": "named",
+                      "name": "ErrWrongState"
+                    }
+                  },
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:98"
+            }
+          ],
+          "pos": "ledger.go:97"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "o",
+                "t": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              },
+              "name": "Status",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "const",
+              "name": "Shipped",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ],
+          "pos": "ledger.go:100"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "o",
+                "t": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              },
+              "name": "Tracking",
+              "t": {
+                "k": "string"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "var",
+              "name": "tracking",
+              "t": {
+                "k": "string"
+              }
+            }
+          ],
+          "pos": "ledger.go:101"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "var",
+              "name": "o",
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "pos": "ledger.go:102"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "l",
+                "t": {
+                  "k": "ptr",
+                  "elem": {
+                    "k": "named",
+                    "name": "Ledger"
+                  }
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "l",
+                    "t": {
+                      "k": "ptr",
+                      "elem": {
+                        "k": "named",
+                        "name": "Ledger"
+                      }
+                    }
+                  },
+                  "name": "events",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "named",
+                      "name": "Event"
+                    }
+                  }
+                },
+                {
+                  "k": "struct",
+                  "name": "Event",
+                  "fields": [
+                    {
+                      "name": "Kind",
+                      "value": {
+                        "k": "const",
+                        "name": "OrderShipped",
+                        "t": {
+                          "k": "named",
+                          "name": "EventKind"
+                        }
+                      }
+                    },
+                    {
+                      "name": "ID",
+                      "value": {
+                        "k": "var",
+                        "name": "id",
+                        "t": {
+                          "k": "named",
+                          "name": "OrderID"
+                        }
+                      }
+                    },
+                    {
+                      "name": "Tracking",
+                      "value": {
+                        "k": "var",
+                        "name": "tracking",
+                        "t": {
+                          "k": "string"
+                        }
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "named",
+                    "name": "Event"
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:103"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "nil",
+              "t": {
+                "k": "error"
+              }
+            }
+          ],
+          "pos": "ledger.go:104"
+        }
+      ],
+      "pos": "ledger.go:92"
+    },
+    {
+      "name": "Cancel",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "id",
+          "t": {
+            "k": "named",
+            "name": "OrderID"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "error"
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "o",
+            "ok"
+          ],
+          "rhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "tuple",
+                "elems": [
+                  {
+                    "k": "named",
+                    "name": "Order"
+                  },
+                  {
+                    "k": "bool"
+                  }
+                ]
+              }
+            }
+          ],
+          "pos": "ledger.go:108"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "unop",
+            "op": "!",
+            "x": {
+              "k": "var",
+              "name": "ok",
+              "t": {
+                "k": "bool"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "intrinsic",
+                  "name": "errorf",
+                  "args": [
+                    {
+                      "k": "lit",
+                      "value": "\"no order %s\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    },
+                    {
+                      "k": "var",
+                      "name": "id",
+                      "t": {
+                        "k": "named",
+                        "name": "OrderID"
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:110"
+            }
+          ],
+          "pos": "ledger.go:109"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "binop",
+            "op": "&&",
+            "x": {
+              "k": "binop",
+              "op": "!=",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "o",
+                  "t": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                },
+                "name": "Status",
+                "t": {
+                  "k": "named",
+                  "name": "Status"
+                }
+              },
+              "y": {
+                "k": "const",
+                "name": "Pending",
+                "t": {
+                  "k": "named",
+                  "name": "Status"
+                }
+              },
+              "t": {
+                "k": "bool"
+              }
+            },
+            "y": {
+              "k": "binop",
+              "op": "!=",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "o",
+                  "t": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                },
+                "name": "Status",
+                "t": {
+                  "k": "named",
+                  "name": "Status"
+                }
+              },
+              "y": {
+                "k": "const",
+                "name": "Paid",
+                "t": {
+                  "k": "named",
+                  "name": "Status"
+                }
+              },
+              "t": {
+                "k": "bool"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "to_error",
+                  "x": {
+                    "k": "struct",
+                    "name": "ErrWrongState",
+                    "fields": [
+                      {
+                        "name": "Status",
+                        "value": {
+                          "k": "field",
+                          "x": {
+                            "k": "var",
+                            "name": "o",
+                            "t": {
+                              "k": "named",
+                              "name": "Order"
+                            }
+                          },
+                          "name": "Status",
+                          "t": {
+                            "k": "named",
+                            "name": "Status"
+                          }
+                        }
+                      }
+                    ],
+                    "t": {
+                      "k": "named",
+                      "name": "ErrWrongState"
+                    }
+                  },
+                  "t": {
+                    "k": "error"
+                  }
+                }
+              ],
+              "pos": "ledger.go:113"
+            }
+          ],
+          "pos": "ledger.go:112"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "o",
+                "t": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              },
+              "name": "Status",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "const",
+              "name": "Cancelled",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ],
+          "pos": "ledger.go:115"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "var",
+              "name": "o",
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          ],
+          "pos": "ledger.go:116"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "l",
+                "t": {
+                  "k": "ptr",
+                  "elem": {
+                    "k": "named",
+                    "name": "Ledger"
+                  }
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "l",
+                    "t": {
+                      "k": "ptr",
+                      "elem": {
+                        "k": "named",
+                        "name": "Ledger"
+                      }
+                    }
+                  },
+                  "name": "events",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "named",
+                      "name": "Event"
+                    }
+                  }
+                },
+                {
+                  "k": "struct",
+                  "name": "Event",
+                  "fields": [
+                    {
+                      "name": "Kind",
+                      "value": {
+                        "k": "const",
+                        "name": "OrderCancelled",
+                        "t": {
+                          "k": "named",
+                          "name": "EventKind"
+                        }
+                      }
+                    },
+                    {
+                      "name": "ID",
+                      "value": {
+                        "k": "var",
+                        "name": "id",
+                        "t": {
+                          "k": "named",
+                          "name": "OrderID"
+                        }
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "named",
+                    "name": "Event"
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:117"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "nil",
+              "t": {
+                "k": "error"
+              }
+            }
+          ],
+          "pos": "ledger.go:118"
+        }
+      ],
+      "pos": "ledger.go:107"
+    },
+    {
+      "name": "Get",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "id",
+          "t": {
+            "k": "named",
+            "name": "OrderID"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "named",
+          "name": "Order"
+        },
+        {
+          "k": "bool"
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "o",
+            "ok"
+          ],
+          "rhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "field",
+                "x": {
+                  "k": "var",
+                  "name": "l",
+                  "t": {
+                    "k": "ptr",
+                    "elem": {
+                      "k": "named",
+                      "name": "Ledger"
+                    }
+                  }
+                },
+                "name": "orders",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "named",
+                    "name": "OrderID"
+                  },
+                  "elem": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                }
+              },
+              "index": {
+                "k": "var",
+                "name": "id",
+                "t": {
+                  "k": "named",
+                  "name": "OrderID"
+                }
+              },
+              "t": {
+                "k": "tuple",
+                "elems": [
+                  {
+                    "k": "named",
+                    "name": "Order"
+                  },
+                  {
+                    "k": "bool"
+                  }
+                ]
+              }
+            }
+          ],
+          "pos": "ledger.go:122"
+        },
+        {
+          "k": "if",
+          "cond": {
+            "k": "unop",
+            "op": "!",
+            "x": {
+              "k": "var",
+              "name": "ok",
+              "t": {
+                "k": "bool"
+              }
+            },
+            "t": {
+              "k": "bool"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "struct",
+                  "name": "Order",
+                  "fields": [],
+                  "t": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                },
+                {
+                  "k": "lit",
+                  "value": "false",
+                  "t": {
+                    "k": "bool"
+                  }
+                }
+              ],
+              "pos": "ledger.go:124"
+            }
+          ],
+          "pos": "ledger.go:123"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "o",
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            },
+            {
+              "k": "lit",
+              "value": "true",
+              "t": {
+                "k": "bool"
+              }
+            }
+          ],
+          "pos": "ledger.go:126"
+        }
+      ],
+      "pos": "ledger.go:121"
+    },
+    {
+      "name": "PendingOrders",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [],
+      "results": [
+        {
+          "k": "slice",
+          "elem": {
+            "k": "named",
+            "name": "Order"
+          }
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "out"
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:131"
+        },
+        {
+          "k": "for_range",
+          "key": "_",
+          "val": "o",
+          "over": {
+            "k": "field",
+            "x": {
+              "k": "var",
+              "name": "l",
+              "t": {
+                "k": "ptr",
+                "elem": {
+                  "k": "named",
+                  "name": "Ledger"
+                }
+              }
+            },
+            "name": "orders",
+            "t": {
+              "k": "map",
+              "key": {
+                "k": "named",
+                "name": "OrderID"
+              },
+              "elem": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          },
+          "body": [
+            {
+              "k": "if",
+              "cond": {
+                "k": "binop",
+                "op": "==",
+                "x": {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "o",
+                    "t": {
+                      "k": "named",
+                      "name": "Order"
+                    }
+                  },
+                  "name": "Status",
+                  "t": {
+                    "k": "named",
+                    "name": "Status"
+                  }
+                },
+                "y": {
+                  "k": "const",
+                  "name": "Pending",
+                  "t": {
+                    "k": "named",
+                    "name": "Status"
+                  }
+                },
+                "t": {
+                  "k": "bool"
+                }
+              },
+              "then": [
+                {
+                  "k": "assign",
+                  "lhs": [
+                    {
+                      "k": "var",
+                      "name": "out",
+                      "t": {
+                        "k": "slice",
+                        "elem": {
+                          "k": "named",
+                          "name": "Order"
+                        }
+                      }
+                    }
+                  ],
+                  "rhs": [
+                    {
+                      "k": "intrinsic",
+                      "name": "append",
+                      "args": [
+                        {
+                          "k": "var",
+                          "name": "out",
+                          "t": {
+                            "k": "slice",
+                            "elem": {
+                              "k": "named",
+                              "name": "Order"
+                            }
+                          }
+                        },
+                        {
+                          "k": "var",
+                          "name": "o",
+                          "t": {
+                            "k": "named",
+                            "name": "Order"
+                          }
+                        }
+                      ],
+                      "t": {
+                        "k": "slice",
+                        "elem": {
+                          "k": "named",
+                          "name": "Order"
+                        }
+                      }
+                    }
+                  ],
+                  "pos": "ledger.go:134"
+                }
+              ],
+              "pos": "ledger.go:133"
+            }
+          ],
+          "pos": "ledger.go:132"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "out",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:137"
+        }
+      ],
+      "doc": "PendingOrders lists the pending orders in map order, which is random; the caller sorts them.",
+      "pos": "ledger.go:130"
+    },
+    {
+      "name": "Drain",
+      "exported": true,
+      "recv": {
+        "name": "l",
+        "t": {
+          "k": "ptr",
+          "elem": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      },
+      "params": [],
+      "results": [
+        {
+          "k": "slice",
+          "elem": {
+            "k": "named",
+            "name": "Event"
+          }
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "out"
+          ],
+          "rhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "l",
+                "t": {
+                  "k": "ptr",
+                  "elem": {
+                    "k": "named",
+                    "name": "Ledger"
+                  }
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:142"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "l",
+                "t": {
+                  "k": "ptr",
+                  "elem": {
+                    "k": "named",
+                    "name": "Ledger"
+                  }
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:143"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "out",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "ledger.go:144"
+        }
+      ],
+      "doc": "Drain returns the events since the last Drain, oldest first, and forgets them.",
+      "pos": "ledger.go:141"
+    }
+  ],
+  "layout": [
+    "type:OrderID",
+    "type:Status",
+    "type:Order",
+    "error:ErrInvalidTotal",
+    "type:ErrWrongState",
+    "func:ErrWrongState.Error",
+    "type:EventKind",
+    "type:Event",
+    "type:Ledger",
+    "func:New",
+    "func:Ledger.Place",
+    "func:Ledger.Pay",
+    "func:Ledger.Ship",
+    "func:Ledger.Cancel",
+    "func:Ledger.Get",
+    "func:Ledger.PendingOrders",
+    "func:Ledger.Drain"
+  ]
+}

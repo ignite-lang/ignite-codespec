@@ -3,6 +3,8 @@ version: "3"
 vars:
   IGNITE: '{{.IGNITE | default "ignite"}}'
   CODESPEC_DIR: '{{.CODESPEC_DIR | default "../codespec"}}'
+  CODESPEC: '{{.CODESPEC | default (printf "%s/target/debug/codespec" .CODESPEC_DIR)}}'
+  ADAPTERS: '{{.ADAPTERS | default (printf "%s/target/adapters" .CODESPEC_DIR)}}'
 
 tasks:
   check:
@@ -10,6 +12,7 @@ tasks:
     cmds:
       - for f in $(find src tools -name '*.ignite' 2>/dev/null); do {{.IGNITE}} check "$f" || exit 1; done
       - task: cir-model
+      - task: harness
 
   cir-model:
     desc: The cir/1 model is current, every example document round trips, the inline tests pass
@@ -48,3 +51,22 @@ tasks:
     desc: Run the inline tests of the model reader and writer and of the generator
     cmds:
       - '{{.IGNITE}} test src/cir_json.ignite tools/gen_model.ignite --out target/ignite-test'
+
+  ledger-cir:
+    desc: Read the ledger's Go source into cir/1, require no refusals, canonical bytes and the checked-in document
+    cmds:
+      - mkdir -p target/ledger-cir
+      - '{{.CODESPEC}} read --lang go examples/ledger/source --out target/ledger-cir/ledger.cir.json --adapters {{.ADAPTERS}}'
+      - '{{.CODESPEC}} validate --canonical target/ledger-cir/ledger.cir.json'
+      - '! grep -q ''"refusals"'' target/ledger-cir/ledger.cir.json'
+      - cmp target/ledger-cir/ledger.cir.json examples/ledger/ledger.cir.json
+
+  harness:
+    desc: Run the ledger's Go original and Ignite reference on 200 seeded traces of 300 commands and require byte-equal output
+    cmds:
+      - test -z "$(gofmt -l examples/ledger)"
+      - '{{.IGNITE}} check examples/ledger/reference.ignite'
+      - '{{.IGNITE}} check examples/ledger/drivers/ignite/driver.ignite'
+      - '{{.IGNITE}} test examples/ledger/reference.ignite --out target/ledger-test'
+      - task: ledger-cir
+      - PATH="$(dirname "$(command -v {{.IGNITE}})"):$PATH" {{.CODESPEC}} harness examples/ledger --seeds 200 --commands 300 --build-dir target/harness
