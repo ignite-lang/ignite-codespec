@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:ignite-writer
 kind: story
-status: proposed
+status: active
 title: 'codespec-write-ignite: cir/1 to Ignite'
 relations:
 - decomposes: epic:ignite-codespec-bridge
@@ -17,9 +17,10 @@ scope:
   path: examples/orders-refusals.expected.json
 - confidence: inferred
   path: src/write.ignite
-revision: 8
+revision: 9
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"review_outcome":2}}}
+- {from: "proposed", to: "active", at: "2026-11-06T02:30:22Z", actor: "human:timo", revision: 9, decided_on: {"recorded":{"review_outcome":2}}}
 ---
 # Story: ignite-writer
 

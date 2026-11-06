@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-06T02:30:21Z",
+  "actor": "human:timo",
+  "artifact": "story:cir-model",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check (wave1 merge, ignite 0.7.0, codespec b73ffce)",
+    "reference": "e465fd8"
+  }
+}

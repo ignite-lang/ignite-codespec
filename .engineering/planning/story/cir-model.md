@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:cir-model
 kind: story
-status: active
+status: implemented
 title: The cir/1 model in Ignite, generated from codespec's schema
 relations:
 - decomposes: epic:ignite-codespec-bridge
@@ -17,10 +17,11 @@ scope:
   path: src/cir_json.ignite
 - confidence: inferred
   path: tools/gen_model.ignite
-revision: 10
+revision: 11
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 9, decided_on: {"recorded":{"review_outcome":1}}}
 - {from: "proposed", to: "active", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"review_outcome":1}}}
+- {from: "active", to: "implemented", at: "2026-11-06T02:30:21Z", actor: "human:timo", revision: 11, decided_on: {"recorded":{"test_result":1,"review_outcome":1}}}
 ---
 # Story: cir-model
 
