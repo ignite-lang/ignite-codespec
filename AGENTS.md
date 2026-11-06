@@ -10,7 +10,10 @@ Ignite adapters for codespec's `cir/1`: `codespec-write-ignite` (`cir/1` → Ign
   `schemas/cir-1.schema.json`). This repository never changes the format; a gap is a refusal here
   and a request there.
 - Ignite is defined by `github.com/ignite-lang/ignite` (`docs/slice.md`). Pin the compiler by commit
-  or release tag.
+  or release tag: `ignite.pin` holds the commit every task runs with as `IGNITE`, the first with
+  `ignite emit --typed-json` (format `ignite-typed/0.1`, `docs/slice.md` section 24), which
+  `codespec-read-ignite` runs. The reader's inline tests hold that command's documents for small
+  source files; regenerate them with the source when the pin moves.
 
 ## Rules
 
@@ -25,6 +28,7 @@ Ignite adapters for codespec's `cir/1`: `codespec-write-ignite` (`cir/1` → Ign
   hand, regenerate it with the generator change.
 - Strict reading, canonical writing, deterministic output: the same input gives the same bytes.
 - What an adapter cannot express is refused with a position and a reason, never approximated.
+- Exception: a program that traps in its source language (Ignite Int overflow) may be written as one that does not; nothing else is approximated.
 - A translation is accepted by codespec's comparison harness only, never by a claim.
 - No comments in `Taskfile.yml` or any other config file.
 - Commit titles follow Conventional Commits; every commit has a bullet body.

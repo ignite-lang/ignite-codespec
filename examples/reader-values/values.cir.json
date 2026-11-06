@@ -1,0 +1,1067 @@
+{
+  "format": "cir/1",
+  "name": "values",
+  "reader": {
+    "language": "ignite",
+    "name": "codespec-read-ignite",
+    "version": "0.0.0"
+  },
+  "types": [
+    {
+      "k": "struct",
+      "name": "Bag",
+      "exported": true,
+      "fields": [
+        {
+          "name": "items",
+          "t": {
+            "k": "map",
+            "key": {
+              "k": "string"
+            },
+            "elem": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        },
+        {
+          "name": "list",
+          "t": {
+            "k": "slice",
+            "elem": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "pos": "values.ignite:8"
+    },
+    {
+      "k": "struct",
+      "name": "Pair",
+      "exported": true,
+      "fields": [
+        {
+          "name": "xs",
+          "t": {
+            "k": "slice",
+            "elem": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "pos": "values.ignite:82"
+    }
+  ],
+  "funcs": [
+    {
+      "name": "count",
+      "exported": true,
+      "params": [
+        {
+          "name": "m",
+          "t": {
+            "k": "map",
+            "key": {
+              "k": "string"
+            },
+            "elem": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "c"
+          ],
+          "rhs": [
+            {
+              "k": "lit",
+              "value": "0",
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:14"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "for (_, v) in m {\n    c = c + v - v + 1\n  }",
+          "reason": "a loop over a map: Ignite's runs in key order, cir/1's in no order",
+          "pos": "values.ignite:15"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "c",
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:18"
+        }
+      ],
+      "pos": "values.ignite:13"
+    },
+    {
+      "name": "alias_list",
+      "exported": true,
+      "params": [],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "a"
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "pos": "values.ignite:23"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "var",
+              "name": "a",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "var",
+                  "name": "a",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                },
+                {
+                  "k": "lit",
+                  "value": "1",
+                  "t": {
+                    "k": "int",
+                    "width": "platform",
+                    "signed": true
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "pos": "values.ignite:24"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "var",
+              "name": "a",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "var",
+                  "name": "a",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                },
+                {
+                  "k": "lit",
+                  "value": "2",
+                  "t": {
+                    "k": "int",
+                    "width": "platform",
+                    "signed": true
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "pos": "values.ignite:25"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "var",
+              "name": "a",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "intrinsic",
+              "name": "append",
+              "args": [
+                {
+                  "k": "var",
+                  "name": "a",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                },
+                {
+                  "k": "lit",
+                  "value": "3",
+                  "t": {
+                    "k": "int",
+                    "width": "platform",
+                    "signed": true
+                  }
+                }
+              ],
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "pos": "values.ignite:26"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "var b = a",
+          "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy",
+          "pos": "values.ignite:27"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "b.push(9)",
+          "reason": "a write in place to a list or map reached from b, which Go shares with the caller or another name: cir/1 has no copy",
+          "pos": "values.ignite:28"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "var c = a",
+          "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy",
+          "pos": "values.ignite:29"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "c.push(7)",
+          "reason": "a write in place to a list or map reached from c, which Go shares with the caller or another name: cir/1 has no copy",
+          "pos": "values.ignite:30"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "b[3]",
+          "reason": "the name b, bound by a statement cir/1 cannot express",
+          "pos": "values.ignite:31"
+        }
+      ],
+      "pos": "values.ignite:22"
+    },
+    {
+      "name": "alias_map",
+      "exported": true,
+      "params": [],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "m"
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "map",
+                "key": {
+                  "k": "string"
+                },
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "pos": "values.ignite:36"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "index",
+              "x": {
+                "k": "var",
+                "name": "m",
+                "t": {
+                  "k": "map",
+                  "key": {
+                    "k": "string"
+                  },
+                  "elem": {
+                    "k": "int",
+                    "width": "platform",
+                    "signed": true
+                  }
+                }
+              },
+              "index": {
+                "k": "lit",
+                "value": "\"a\"",
+                "t": {
+                  "k": "string"
+                }
+              },
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "lit",
+              "value": "1",
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:37"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "var k = m",
+          "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy",
+          "pos": "values.ignite:38"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "k.put(\"b\", 2)",
+          "reason": "a write in place to a list or map reached from k, which Go shares with the caller or another name: cir/1 has no copy",
+          "pos": "values.ignite:39"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "call",
+              "name": "count",
+              "args": [
+                {
+                  "k": "var",
+                  "name": "m",
+                  "t": {
+                    "k": "map",
+                    "key": {
+                      "k": "string"
+                    },
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:40"
+        }
+      ],
+      "pos": "values.ignite:35"
+    },
+    {
+      "name": "fill",
+      "exported": true,
+      "params": [
+        {
+          "name": "m",
+          "t": {
+            "k": "map",
+            "key": {
+              "k": "string"
+            },
+            "elem": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "var k = m",
+          "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy",
+          "pos": "values.ignite:44"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "k.put(\"x\", 1)",
+          "reason": "a write in place to a list or map reached from k, which Go shares with the caller or another name: cir/1 has no copy",
+          "pos": "values.ignite:45"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "count(k)",
+          "reason": "the name k, bound by a statement cir/1 cannot express",
+          "pos": "values.ignite:46"
+        }
+      ],
+      "pos": "values.ignite:43"
+    },
+    {
+      "name": "param_map",
+      "exported": true,
+      "params": [],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "m"
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "map",
+                "key": {
+                  "k": "string"
+                },
+                "elem": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              }
+            }
+          ],
+          "pos": "values.ignite:51"
+        },
+        {
+          "k": "let",
+          "names": [
+            "filled"
+          ],
+          "rhs": [
+            {
+              "k": "call",
+              "name": "fill",
+              "args": [
+                {
+                  "k": "var",
+                  "name": "m",
+                  "t": {
+                    "k": "map",
+                    "key": {
+                      "k": "string"
+                    },
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:52"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "binop",
+              "op": "-",
+              "x": {
+                "k": "binop",
+                "op": "+",
+                "x": {
+                  "k": "call",
+                  "name": "count",
+                  "args": [
+                    {
+                      "k": "var",
+                      "name": "m",
+                      "t": {
+                        "k": "map",
+                        "key": {
+                          "k": "string"
+                        },
+                        "elem": {
+                          "k": "int",
+                          "width": "platform",
+                          "signed": true
+                        }
+                      }
+                    }
+                  ],
+                  "t": {
+                    "k": "int",
+                    "width": "platform",
+                    "signed": true
+                  }
+                },
+                "y": {
+                  "k": "var",
+                  "name": "filled",
+                  "t": {
+                    "k": "int",
+                    "width": "platform",
+                    "signed": true
+                  }
+                },
+                "t": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              },
+              "y": {
+                "k": "var",
+                "name": "filled",
+                "t": {
+                  "k": "int",
+                  "width": "platform",
+                  "signed": true
+                }
+              },
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:53"
+        }
+      ],
+      "pos": "values.ignite:50"
+    },
+    {
+      "name": "record_map",
+      "exported": true,
+      "params": [],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "a"
+          ],
+          "rhs": [
+            {
+              "k": "struct",
+              "name": "Bag",
+              "fields": [
+                {
+                  "name": "items",
+                  "value": {
+                    "k": "make",
+                    "t": {
+                      "k": "map",
+                      "key": {
+                        "k": "string"
+                      },
+                      "elem": {
+                        "k": "int",
+                        "width": "platform",
+                        "signed": true
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "list",
+                  "value": {
+                    "k": "make",
+                    "t": {
+                      "k": "slice",
+                      "elem": {
+                        "k": "int",
+                        "width": "platform",
+                        "signed": true
+                      }
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "named",
+                "name": "Bag"
+              }
+            }
+          ],
+          "pos": "values.ignite:58"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "var b = a",
+          "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy",
+          "pos": "values.ignite:59"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "b.items.put(\"x\", 1)",
+          "reason": "a write in place to a list or map reached from b, which Go shares with the caller or another name: cir/1 has no copy",
+          "pos": "values.ignite:60"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "call",
+              "name": "count",
+              "args": [
+                {
+                  "k": "field",
+                  "x": {
+                    "k": "var",
+                    "name": "a",
+                    "t": {
+                      "k": "named",
+                      "name": "Bag"
+                    }
+                  },
+                  "name": "items",
+                  "t": {
+                    "k": "map",
+                    "key": {
+                      "k": "string"
+                    },
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:61"
+        }
+      ],
+      "pos": "values.ignite:57"
+    },
+    {
+      "name": "arm_wild",
+      "exported": true,
+      "params": [
+        {
+          "name": "x",
+          "t": {
+            "k": "int",
+            "width": "platform",
+            "signed": true
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "string"
+        }
+      ],
+      "body": [
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "match x {\n  _ => \"any\"\n  1 => \"one\"\n}",
+          "reason": "a catch-all `match` arm before another arm: `match` takes the first arm that matches, cir/1's `switch` its default last",
+          "pos": "values.ignite:65"
+        }
+      ],
+      "pos": "values.ignite:65"
+    },
+    {
+      "name": "arm_bind",
+      "exported": true,
+      "params": [
+        {
+          "name": "x",
+          "t": {
+            "k": "int",
+            "width": "platform",
+            "signed": true
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "string"
+        }
+      ],
+      "body": [
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "match x {\n  other => \"any {other}\"\n  1 => \"one\"\n}",
+          "reason": "a catch-all `match` arm before another arm: `match` takes the first arm that matches, cir/1's `switch` its default last",
+          "pos": "values.ignite:70"
+        }
+      ],
+      "pos": "values.ignite:70"
+    },
+    {
+      "name": "bump",
+      "exported": true,
+      "params": [
+        {
+          "name": "a",
+          "t": {
+            "k": "int",
+            "width": "platform",
+            "signed": true
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "x"
+          ],
+          "rhs": [
+            {
+              "k": "var",
+              "name": "a",
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "values.ignite:77"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "let x = x + 1",
+          "reason": "a `let` of x, which its block already declares: Go's := declares no new variable",
+          "pos": "values.ignite:78"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "x",
+          "reason": "the name x, bound by a statement cir/1 cannot express",
+          "pos": "values.ignite:79"
+        }
+      ],
+      "pos": "values.ignite:76"
+    },
+    {
+      "name": "same",
+      "exported": true,
+      "params": [
+        {
+          "name": "a",
+          "t": {
+            "k": "named",
+            "name": "Pair"
+          }
+        },
+        {
+          "name": "b",
+          "t": {
+            "k": "named",
+            "name": "Pair"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "bool"
+        }
+      ],
+      "body": [
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "a == b",
+          "reason": "== on Pair: cir/1's == does not compare lists, maps or unions by value",
+          "pos": "values.ignite:87"
+        }
+      ],
+      "pos": "values.ignite:87"
+    }
+  ],
+  "layout": [
+    "type:Bag",
+    "func:count",
+    "func:alias_list",
+    "func:alias_map",
+    "func:fill",
+    "func:param_map",
+    "func:record_map",
+    "func:arm_wild",
+    "func:arm_bind",
+    "func:bump",
+    "type:Pair",
+    "func:same"
+  ],
+  "refusals": [
+    {
+      "pos": "values.ignite:15",
+      "what": "for (_, v) in m { …",
+      "reason": "a loop over a map: Ignite's runs in key order, cir/1's in no order"
+    },
+    {
+      "pos": "values.ignite:27",
+      "what": "var b = a",
+      "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:28",
+      "what": "b.push(9)",
+      "reason": "a write in place to a list or map reached from b, which Go shares with the caller or another name: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:29",
+      "what": "var c = a",
+      "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:30",
+      "what": "c.push(7)",
+      "reason": "a write in place to a list or map reached from c, which Go shares with the caller or another name: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:31",
+      "what": "b[3]",
+      "reason": "the name b, bound by a statement cir/1 cannot express"
+    },
+    {
+      "pos": "values.ignite:38",
+      "what": "var k = m",
+      "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:39",
+      "what": "k.put(\"b\", 2)",
+      "reason": "a write in place to a list or map reached from k, which Go shares with the caller or another name: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:44",
+      "what": "var k = m",
+      "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:45",
+      "what": "k.put(\"x\", 1)",
+      "reason": "a write in place to a list or map reached from k, which Go shares with the caller or another name: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:46",
+      "what": "count(k)",
+      "reason": "the name k, bound by a statement cir/1 cannot express"
+    },
+    {
+      "pos": "values.ignite:59",
+      "what": "var b = a",
+      "reason": "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:60",
+      "what": "b.items.put(\"x\", 1)",
+      "reason": "a write in place to a list or map reached from b, which Go shares with the caller or another name: cir/1 has no copy"
+    },
+    {
+      "pos": "values.ignite:65",
+      "what": "match x { …",
+      "reason": "a catch-all `match` arm before another arm: `match` takes the first arm that matches, cir/1's `switch` its default last"
+    },
+    {
+      "pos": "values.ignite:70",
+      "what": "match x { …",
+      "reason": "a catch-all `match` arm before another arm: `match` takes the first arm that matches, cir/1's `switch` its default last"
+    },
+    {
+      "pos": "values.ignite:78",
+      "what": "let x = x + 1",
+      "reason": "a `let` of x, which its block already declares: Go's := declares no new variable"
+    },
+    {
+      "pos": "values.ignite:79",
+      "what": "x",
+      "reason": "the name x, bound by a statement cir/1 cannot express"
+    },
+    {
+      "pos": "values.ignite:87",
+      "what": "a == b",
+      "reason": "== on Pair: cir/1's == does not compare lists, maps or unions by value"
+    }
+  ]
+}

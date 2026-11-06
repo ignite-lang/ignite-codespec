@@ -93,6 +93,53 @@ the typed JSON to `cir/1`. Ignite constructs with no `cir/1` node are `foreign` 
 `refusals` entry: declarations of systems, components, protocols and contracts; `spawn` and `await`;
 capability resources; closures until `cir/1` has a node for them.
 
+### As read (C3, `src/read.ignite`)
+
+- `codespec-read-ignite SOURCE` runs `ignite emit --typed-json SOURCE` with the program the
+  setting `--ignite` names (default `ignite` on `PATH`; `codespec read` passes no setting, so the
+  task puts the pinned compiler first on `PATH` as `ignite`) and prints the module on stdout in
+  canonical form. The mapping table is the file's header; each row has an inline test.
+- The module is the last segment of the package; positions are `<file name>:<line>`; the reader
+  is `{ignite, codespec-read-ignite, 0.0.0}`; every declaration is `exported`.
+- Inverse of the writer where it writes: `fn E.value` becomes the enum's values, the writer's
+  `enum Error` with `fn Error.text` becomes sentinels (`Msg(t)` is `errorf("%s", t)`),
+  `wrapping_add`/`wrapping_sub` become `+`/`-`, `x = x + 1` is `incr`, `T.m(r: T, ..)` is a
+  method, `let x = match m.get(k) { Some(x) => x, None => { .. return } }` is `lookup_else`.
+- An enum without a `value` fn gets the values 0, 1, … (no Ignite program observes them). A
+  union variant's payload fields are `f0`, `f1`, …. Text literals are written in Go's (JSON's)
+  spelling, which the writer decodes.
+- Not expressible, so refused: generic types and functions, records with non-zero field
+  defaults, union values and `match` that takes data apart, `Result` with another error type,
+  `?`, closures, `while`/`loop`, list literals, `assert`, effects. Tests are not read.
+- `Int` is `int {width: platform}`, the type cir/1 gives Go's `int` and `len`, so `len` needs
+  no conversion.
+- Values against shared storage: Ignite's lists, maps and records holding them are values, Go's
+  slices and maps share storage, and cir/1 has no copy. In a function that writes a list or map
+  in place (`push`, `put`), a read of a variable holding one where Ignite copies it (`let`,
+  assignment, record field, element, argument of a call that writes in place or returns one) is
+  refused, and a write in place must start from a local a `let` or `var` there made (not a
+  parameter, loop variable or lookup). Returning such a local moves it. Over-refusal is the
+  price: no copy is inserted, since cir/1 cannot express one.
+- `match` takes its first matching arm, `switch` its default last: a catch-all arm before
+  another arm is refused, as is a value two arms name. A `match` without a catch-all is
+  exhaustive, so as a function's value its last case is the default (Go needs the return).
+- Refused because Go cannot build the cir/1 they would give: a `let` of a name its block already
+  declares (`:=` with no new variable), `==` on a value holding a list, map or union, a block
+  in statement position. A name bound by a refused statement is refused where it is used, never
+  read as an outer variable of the same name.
+- A loop over a map is refused: Ignite's runs in key order, cir/1's in none (codespec's
+  `unordered_iteration` fact marks a position; cir/1 has no ordered form).
+- Exception, stated: Ignite's `Int` operators trap on overflow where cir/1's wrap. The two
+  differ only on a program that traps, which is written as one that does not (`AGENTS.md`).
+- Known gap: the typed document resolves aliases, so a newtype's uses read as its underlying
+  type.
+- `examples/reader-values/values.cir.json` and `examples/reader-builds/builds.cir.json` are the
+  documents of the adversary cases (`task reader-values`, `task reader-builds`): the first
+  refuses every case with its position and reason, the second's Go builds and matches Ignite in
+  the harness.
+- `examples/ledger/reference.cir.json` is the reader's document of the ledger reference, kept
+  byte-equal by `task read-ledger`.
+
 ## 5. Evidence
 
 A translation is accepted only by codespec's comparison harness (codespec M1): the original and the

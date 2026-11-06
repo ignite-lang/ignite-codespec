@@ -14,6 +14,65 @@ tasks:
       - task: cir-model
       - task: harness
       - task: writer
+      - task: reader
+
+  reader:
+    desc: The reader's inline tests pass; the ledger reference reads as a canonical document, the same bytes twice, equal to the checked-in one; the adversary cases read as their checked-in documents and the kept ones build as Go
+    cmds:
+      - task: test-reader
+      - task: read-ledger
+      - task: reader-values
+      - task: reader-builds
+
+  reader-builds:
+    desc: Read examples/reader-builds/source/builds.ignite; the document equals examples/reader-builds/builds.cir.json, and the Go written from it builds and gives the Ignite original's output
+    cmds:
+      - task: reader-adapter
+      - '{{.IGNITE}} test examples/reader-builds/source/builds.ignite --out target/reader-builds/test'
+      - mkdir -p target/reader-builds/bin
+      - ln -sf "$(realpath "$(command -v {{.IGNITE}})")" target/reader-builds/bin/ignite
+      - PATH="$PWD/target/reader-builds/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/reader-builds/source/builds.ignite --out target/reader-builds/builds.cir.json --adapters target/adapters
+      - '{{.CODESPEC}} validate --canonical target/reader-builds/builds.cir.json'
+      - cmp target/reader-builds/builds.cir.json examples/reader-builds/builds.cir.json
+      - '{{.CODESPEC}} pass target/reader-builds/builds.cir.json --out target/reader-builds/builds.facts.json'
+      - '{{.CODESPEC}} write --lang go target/reader-builds/builds.facts.json --out target/reader-builds/go --adapters {{.ADAPTERS}}'
+      - PATH="$PWD/target/reader-builds/bin:$PATH" {{.CODESPEC}} harness examples/reader-builds --seeds 1 --commands 1 --build-dir target/reader-builds/harness
+
+  reader-values:
+    desc: Read examples/reader-values/source/values.ignite; the document validates as canonical and equals examples/reader-values/values.cir.json, which refuses each case with its position and reason
+    cmds:
+      - task: reader-adapter
+      - '{{.IGNITE}} test examples/reader-values/source/values.ignite --out target/reader-values/test'
+      - mkdir -p target/reader-values/bin
+      - ln -sf "$(realpath "$(command -v {{.IGNITE}})")" target/reader-values/bin/ignite
+      - PATH="$PWD/target/reader-values/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/reader-values/source/values.ignite --out target/reader-values/values.cir.json --adapters target/adapters
+      - '{{.CODESPEC}} validate --canonical target/reader-values/values.cir.json'
+      - cmp target/reader-values/values.cir.json examples/reader-values/values.cir.json
+
+  reader-adapter:
+    desc: Build codespec-read-ignite into target/adapters, the --adapters directory of codespec read --lang ignite
+    run: once
+    cmds:
+      - '{{.IGNITE}} build src/read.ignite --out target/ignite/read'
+      - mkdir -p target/adapters
+      - cp target/ignite/read/bin/codespec-read-ignite target/adapters/codespec-read-ignite
+
+  test-reader:
+    desc: Run the inline tests of the reader
+    cmds:
+      - '{{.IGNITE}} test src/read.ignite --out target/ignite-test-reader'
+
+  read-ledger:
+    desc: Read examples/ledger/reference.ignite twice with the IGNITE compiler as `ignite`; the document validates as canonical, both reads are byte-equal and equal examples/ledger/reference.cir.json
+    cmds:
+      - task: reader-adapter
+      - mkdir -p target/read/bin
+      - ln -sf "$(realpath "$(command -v {{.IGNITE}})")" target/read/bin/ignite
+      - PATH="$PWD/target/read/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/ledger/reference.ignite --out target/read/ledger.cir.json --adapters target/adapters
+      - PATH="$PWD/target/read/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/ledger/reference.ignite --out target/read/ledger.again.cir.json --adapters target/adapters
+      - '{{.CODESPEC}} validate --canonical target/read/ledger.cir.json'
+      - cmp target/read/ledger.cir.json target/read/ledger.again.cir.json
+      - cmp target/read/ledger.cir.json examples/ledger/reference.cir.json
 
   writer:
     desc: The writer's inline tests pass, its output of the ledger and orders examples equals the checked-in output and checks silently

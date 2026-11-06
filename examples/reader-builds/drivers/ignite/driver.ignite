@@ -1,0 +1,38 @@
+package buildsdriver
+
+import buildsdriver.builds.{Color, size, name}
+
+// The harness driver of the Ignite original: reads and ignores the trace, prints one line per
+// case of `builds.ignite` (its sibling through the link `builds.ignite` beside this file).
+
+type Driver {
+  executable: Text
+}
+
+fn Driver.main(self: Driver) -> Result<Unit, IoError> {
+  read_all()?
+  var xs: List<Int> = []
+  xs.push(1)
+  xs.push(2)
+  let out = [
+    "size {size(xs)}",
+    "name {name(Color.Green)}"
+  ]
+  Stdout.write_all(out.map(|l| l + "\n").join("").to_bytes())
+}
+
+fn read_all() -> Result<Bytes, IoError> requires [stdin.read] {
+  var data = Bytes.empty()
+  loop {
+    match Stdin.read(65536)? {
+      Eof => return Ok(data)
+      Data(more) => data.append(more)
+    }
+  }
+}
+
+system Harness {
+  component driver: Driver {
+    executable = "builds-ignite"
+  }
+}

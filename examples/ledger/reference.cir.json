@@ -1,0 +1,857 @@
+{
+  "format": "cir/1",
+  "name": "ledger",
+  "reader": {
+    "language": "ignite",
+    "name": "codespec-read-ignite",
+    "version": "0.0.0"
+  },
+  "types": [
+    {
+      "k": "enum",
+      "name": "Status",
+      "exported": true,
+      "under": {
+        "k": "int",
+        "width": "platform",
+        "signed": true
+      },
+      "variants": [
+        {
+          "name": "Pending",
+          "value": {
+            "k": "lit",
+            "value": "0",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        },
+        {
+          "name": "Paid",
+          "value": {
+            "k": "lit",
+            "value": "1",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        },
+        {
+          "name": "Shipped",
+          "value": {
+            "k": "lit",
+            "value": "2",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        },
+        {
+          "name": "Cancelled",
+          "value": {
+            "k": "lit",
+            "value": "3",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "pos": "reference.ignite:9"
+    },
+    {
+      "k": "struct",
+      "name": "Order",
+      "exported": true,
+      "fields": [
+        {
+          "name": "id",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "customer",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "total",
+          "t": {
+            "k": "int",
+            "width": "platform",
+            "signed": true
+          }
+        },
+        {
+          "name": "status",
+          "t": {
+            "k": "named",
+            "name": "Status"
+          }
+        },
+        {
+          "name": "tracking",
+          "t": {
+            "k": "string"
+          }
+        },
+        {
+          "name": "gift",
+          "t": {
+            "k": "bool"
+          }
+        }
+      ],
+      "pos": "reference.ignite:16"
+    },
+    {
+      "k": "union",
+      "name": "LedgerError",
+      "exported": true,
+      "variants": [
+        {
+          "name": "InvalidTotal",
+          "fields": []
+        },
+        {
+          "name": "NoOrder",
+          "fields": [
+            {
+              "name": "f0",
+              "t": {
+                "k": "string"
+              }
+            }
+          ]
+        },
+        {
+          "name": "WrongState",
+          "fields": [
+            {
+              "name": "f0",
+              "t": {
+                "k": "named",
+                "name": "Status"
+              }
+            }
+          ]
+        }
+      ],
+      "pos": "reference.ignite:25"
+    },
+    {
+      "k": "union",
+      "name": "Event",
+      "exported": true,
+      "variants": [
+        {
+          "name": "OrderPlaced",
+          "fields": [
+            {
+              "name": "f0",
+              "t": {
+                "k": "string"
+              }
+            },
+            {
+              "name": "f1",
+              "t": {
+                "k": "string"
+              }
+            },
+            {
+              "name": "f2",
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ]
+        },
+        {
+          "name": "OrderPaid",
+          "fields": [
+            {
+              "name": "f0",
+              "t": {
+                "k": "string"
+              }
+            }
+          ]
+        },
+        {
+          "name": "OrderShipped",
+          "fields": [
+            {
+              "name": "f0",
+              "t": {
+                "k": "string"
+              }
+            },
+            {
+              "name": "f1",
+              "t": {
+                "k": "string"
+              }
+            }
+          ]
+        },
+        {
+          "name": "OrderCancelled",
+          "fields": [
+            {
+              "name": "f0",
+              "t": {
+                "k": "string"
+              }
+            }
+          ]
+        }
+      ],
+      "pos": "reference.ignite:32"
+    },
+    {
+      "k": "struct",
+      "name": "Ledger",
+      "exported": true,
+      "fields": [
+        {
+          "name": "orders",
+          "t": {
+            "k": "map",
+            "key": {
+              "k": "string"
+            },
+            "elem": {
+              "k": "named",
+              "name": "Order"
+            }
+          }
+        },
+        {
+          "name": "events",
+          "t": {
+            "k": "slice",
+            "elem": {
+              "k": "named",
+              "name": "Event"
+            }
+          }
+        },
+        {
+          "name": "seq",
+          "t": {
+            "k": "int",
+            "width": "platform",
+            "signed": true
+          }
+        }
+      ],
+      "pos": "reference.ignite:39"
+    }
+  ],
+  "funcs": [
+    {
+      "name": "new",
+      "exported": true,
+      "params": [],
+      "results": [
+        {
+          "k": "named",
+          "name": "Ledger"
+        }
+      ],
+      "body": [
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "struct",
+              "name": "Ledger",
+              "fields": [
+                {
+                  "name": "orders",
+                  "value": {
+                    "k": "make",
+                    "t": {
+                      "k": "map",
+                      "key": {
+                        "k": "string"
+                      },
+                      "elem": {
+                        "k": "named",
+                        "name": "Order"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "events",
+                  "value": {
+                    "k": "make",
+                    "t": {
+                      "k": "slice",
+                      "elem": {
+                        "k": "named",
+                        "name": "Event"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "seq",
+                  "value": {
+                    "k": "lit",
+                    "value": "0",
+                    "t": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "named",
+                "name": "Ledger"
+              }
+            }
+          ],
+          "pos": "reference.ignite:51"
+        }
+      ],
+      "pos": "reference.ignite:51"
+    },
+    {
+      "name": "label",
+      "exported": true,
+      "params": [
+        {
+          "name": "status",
+          "t": {
+            "k": "named",
+            "name": "Status"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "string"
+        }
+      ],
+      "body": [
+        {
+          "k": "switch",
+          "tag": {
+            "k": "var",
+            "name": "status",
+            "t": {
+              "k": "named",
+              "name": "Status"
+            }
+          },
+          "cases": [
+            {
+              "values": [
+                {
+                  "k": "const",
+                  "name": "Pending",
+                  "t": {
+                    "k": "named",
+                    "name": "Status"
+                  }
+                }
+              ],
+              "body": [
+                {
+                  "k": "return",
+                  "results": [
+                    {
+                      "k": "lit",
+                      "value": "\"pending\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    }
+                  ],
+                  "pos": "reference.ignite:54"
+                }
+              ]
+            },
+            {
+              "values": [
+                {
+                  "k": "const",
+                  "name": "Paid",
+                  "t": {
+                    "k": "named",
+                    "name": "Status"
+                  }
+                }
+              ],
+              "body": [
+                {
+                  "k": "return",
+                  "results": [
+                    {
+                      "k": "lit",
+                      "value": "\"paid\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    }
+                  ],
+                  "pos": "reference.ignite:55"
+                }
+              ]
+            },
+            {
+              "values": [
+                {
+                  "k": "const",
+                  "name": "Shipped",
+                  "t": {
+                    "k": "named",
+                    "name": "Status"
+                  }
+                }
+              ],
+              "body": [
+                {
+                  "k": "return",
+                  "results": [
+                    {
+                      "k": "lit",
+                      "value": "\"shipped\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    }
+                  ],
+                  "pos": "reference.ignite:56"
+                }
+              ]
+            },
+            {
+              "values": [],
+              "body": [
+                {
+                  "k": "return",
+                  "results": [
+                    {
+                      "k": "lit",
+                      "value": "\"cancelled\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    }
+                  ],
+                  "pos": "reference.ignite:57"
+                }
+              ]
+            }
+          ],
+          "pos": "reference.ignite:53"
+        }
+      ],
+      "pos": "reference.ignite:53"
+    },
+    {
+      "name": "message",
+      "exported": true,
+      "params": [
+        {
+          "name": "error",
+          "t": {
+            "k": "named",
+            "name": "LedgerError"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "string"
+        }
+      ],
+      "body": [
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "match error {\n  InvalidTotal => \"total must be positive\"\n  NoOrder(id) => \"no order {id}\"\n  WrongState(status) => \"order is {label(status)}\"\n}",
+          "reason": "a `match` on the enum with payloads LedgerError: cir/1 has no expression for a union value",
+          "pos": "reference.ignite:60"
+        }
+      ],
+      "pos": "reference.ignite:60"
+    },
+    {
+      "name": "get",
+      "exported": true,
+      "params": [
+        {
+          "name": "ledger",
+          "t": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        },
+        {
+          "name": "id",
+          "t": {
+            "k": "string"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "named",
+          "name": "Order"
+        },
+        {
+          "k": "bool"
+        }
+      ],
+      "body": [
+        {
+          "k": "lookup_else",
+          "name": "v",
+          "map": {
+            "k": "field",
+            "x": {
+              "k": "var",
+              "name": "ledger",
+              "t": {
+                "k": "named",
+                "name": "Ledger"
+              }
+            },
+            "name": "orders",
+            "t": {
+              "k": "map",
+              "key": {
+                "k": "string"
+              },
+              "elem": {
+                "k": "named",
+                "name": "Order"
+              }
+            }
+          },
+          "index": {
+            "k": "var",
+            "name": "id",
+            "t": {
+              "k": "string"
+            }
+          },
+          "then": [
+            {
+              "k": "return",
+              "results": [
+                {
+                  "k": "zero",
+                  "t": {
+                    "k": "named",
+                    "name": "Order"
+                  }
+                },
+                {
+                  "k": "lit",
+                  "value": "false",
+                  "t": {
+                    "k": "bool"
+                  }
+                }
+              ],
+              "pos": "reference.ignite:102"
+            }
+          ],
+          "pos": "reference.ignite:102"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "v",
+              "t": {
+                "k": "named",
+                "name": "Order"
+              }
+            },
+            {
+              "k": "lit",
+              "value": "true",
+              "t": {
+                "k": "bool"
+              }
+            }
+          ],
+          "pos": "reference.ignite:102"
+        }
+      ],
+      "pos": "reference.ignite:102"
+    },
+    {
+      "name": "pending_orders",
+      "exported": true,
+      "params": [
+        {
+          "name": "ledger",
+          "t": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "slice",
+          "elem": {
+            "k": "named",
+            "name": "Order"
+          }
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "out"
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              }
+            }
+          ],
+          "pos": "reference.ignite:106"
+        },
+        {
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "for (_, order) in ledger.orders {\n    if order.status == Pending {\n      out.push(order)\n    }\n  }",
+          "reason": "a loop over a map: Ignite's runs in key order, cir/1's in no order",
+          "pos": "reference.ignite:107"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "out",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Order"
+                }
+              }
+            }
+          ],
+          "pos": "reference.ignite:112"
+        }
+      ],
+      "pos": "reference.ignite:105"
+    },
+    {
+      "name": "drain",
+      "exported": true,
+      "params": [
+        {
+          "name": "ledger",
+          "t": {
+            "k": "named",
+            "name": "Ledger"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "named",
+          "name": "Ledger"
+        },
+        {
+          "k": "slice",
+          "elem": {
+            "k": "named",
+            "name": "Event"
+          }
+        }
+      ],
+      "body": [
+        {
+          "k": "let",
+          "names": [
+            "next"
+          ],
+          "rhs": [
+            {
+              "k": "var",
+              "name": "ledger",
+              "t": {
+                "k": "named",
+                "name": "Ledger"
+              }
+            }
+          ],
+          "pos": "reference.ignite:117"
+        },
+        {
+          "k": "assign",
+          "lhs": [
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "next",
+                "t": {
+                  "k": "named",
+                  "name": "Ledger"
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "rhs": [
+            {
+              "k": "make",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "reference.ignite:118"
+        },
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "var",
+              "name": "next",
+              "t": {
+                "k": "named",
+                "name": "Ledger"
+              }
+            },
+            {
+              "k": "field",
+              "x": {
+                "k": "var",
+                "name": "ledger",
+                "t": {
+                  "k": "named",
+                  "name": "Ledger"
+                }
+              },
+              "name": "events",
+              "t": {
+                "k": "slice",
+                "elem": {
+                  "k": "named",
+                  "name": "Event"
+                }
+              }
+            }
+          ],
+          "pos": "reference.ignite:119"
+        }
+      ],
+      "pos": "reference.ignite:116"
+    }
+  ],
+  "layout": [
+    "type:Status",
+    "type:Order",
+    "type:LedgerError",
+    "type:Event",
+    "type:Ledger",
+    "func:new",
+    "func:label",
+    "func:message",
+    "func:get",
+    "func:pending_orders",
+    "func:drain"
+  ],
+  "refusals": [
+    {
+      "pos": "reference.ignite:46",
+      "what": "Step",
+      "reason": "a generic type: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:60",
+      "what": "match error { …",
+      "reason": "a `match` on the enum with payloads LedgerError: cir/1 has no expression for a union value"
+    },
+    {
+      "pos": "reference.ignite:66",
+      "what": "place",
+      "reason": "result: the generic type `Step<Text>`: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:78",
+      "what": "pay",
+      "reason": "result: the generic type `Step<Unit>`: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:86",
+      "what": "ship",
+      "reason": "result: the generic type `Step<Unit>`: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:94",
+      "what": "cancel",
+      "reason": "result: the generic type `Step<Unit>`: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:107",
+      "what": "for (_, order) in ledger.orders { …",
+      "reason": "a loop over a map: Ignite's runs in key order, cir/1's in no order"
+    },
+    {
+      "pos": "reference.ignite:122",
+      "what": "find",
+      "reason": "result: a result `Result<Order, LedgerError>` whose error is not the module's `enum Error` of sentinels and `Msg(Text)`"
+    },
+    {
+      "pos": "reference.ignite:127",
+      "what": "refused",
+      "reason": "result: the generic type `Step<Unit>`: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:129",
+      "what": "recorded",
+      "reason": "result: the generic type `Step<Unit>`: cir/1 has no type parameters"
+    }
+  ]
+}
