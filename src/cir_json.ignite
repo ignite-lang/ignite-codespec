@@ -1,0 +1,240 @@
+package codespec
+
+import std.json.{Json, parse, get, encode, quote}
+import std.fs.{read_text_file}
+import std.text.{ends_with}
+import std.io.IoError
+import codespec.cir.{CirModule, ReadError, describe}
+
+// Reading and writing cir/1 JSON documents.
+//
+// `read` is strict, as codespec's own reader is (`Module::from_json` in codespec's
+// `crates/model`): the document is one JSON object whose `format` is `cir/1`, and an unknown
+// or repeated field, an unknown kind, a missing required field (an expression without its
+// type `t` among them) or a value of the wrong JSON kind is refused with its JSON path.
+// `write` is canonical: the bytes codespec writes for the same module (`Module::to_json`,
+// serde_json's pretty printer): members in declaration order, empty optional members omitted,
+// two-space indentation, `": "` after a name, `[]` and `{}` for empty containers, strings
+// escaped as serde_json escapes them, and a final newline.
+//
+// This file is also the executable `cir-roundtrip` (`task roundtrip-check`), and it is a
+// program file (package `codespec`), not a sibling module: `ignite test` runs no test of a
+// sibling module, and a sibling module given to it as a file cannot import its siblings.
+
+const FORMAT: Text = "cir/1"
+
+// The module of the cir/1 document `text`.
+fn read(text: Text) -> Result<CirModule, ReadError> {
+  let value = match parse(text) {
+    Ok(value) => value
+    Err(e) => return Err(ReadError { path = "$", message = "not JSON: " + e.message + " at byte " + e.offset.to_text() })
+  }
+  match value {
+    Json.Object(_) => {}
+    _ => return Err(ReadError { path = "$", message = "expected an object" })
+  }
+  match get(value, "format") {
+    Some(Json.Str(format)) => {
+      if format != FORMAT {
+        return Err(ReadError { path = "$.format", message = "format is `" + format + "`, this reader reads `" + FORMAT + "`" })
+      }
+    }
+    Some(_) => return Err(ReadError { path = "$.format", message = "expected a string" })
+    Option.None => return Err(ReadError { path = "$", message = "missing field `format`" })
+  }
+  CirModule.from_json(value, "$")
+}
+
+// The canonical cir/1 text of `document`.
+fn write(document: CirModule) -> Text = pretty(CirModule.to_json(document), "") + "\n"
+
+// `value` as serde_json's pretty printer writes it, its closing bracket at `indent`.
+fn pretty(value: Json, indent: Text) -> Text = match value {
+  Json.Array(items) => {
+    if items.is_empty() {
+      return "[]"
+    }
+    let inner = indent + "  "
+    "[\n" + items.map(|item| inner + pretty(item, inner)).join(",\n") + "\n" + indent + "]"
+  }
+  Json.Object(members) => {
+    if members.is_empty() {
+      return r"{}"
+    }
+    let inner = indent + "  "
+    r"{" + "\n" + members.map(|m| inner + quote(m.0) + ": " + pretty(m.1, inner)).join(",\n") + "\n" + indent + r"}"
+  }
+  other => encode(other)
+}
+
+// ---- the executable ----------------------------------------------------------------------
+
+// Reads and re-encodes every `examples/*/*.cir.json` under `root`; one line per document, then
+// the count. Exit 1 when a document is refused or comes back with other bytes, or when there
+// is none.
+type Roundtrip {
+  root: Directory
+  executable: Text
+}
+
+// The paths of `examples/*/*.cir.json` under `root`, in byte order.
+fn documents(root: Directory) -> Result<List<Text>, IoError> requires [root.read] {
+  var out: List<Text> = []
+  for entry in root.read_directory("examples")? {
+    if ends_with(entry, "/") {
+      for name in root.read_directory("examples/" + entry)? {
+        if ends_with(name, ".cir.json") {
+          out.push("examples/" + entry + name)
+        }
+      }
+    }
+  }
+  Ok(out)
+}
+
+// The offset of the first byte where `a` and `b` differ.
+fn first_difference(a: Text, b: Text) -> Int {
+  let x = a.to_bytes()
+  let y = b.to_bytes()
+  var i = 0
+  while i < x.len() && i < y.len() && x.at(i) == y.at(i) {
+    i = i + 1
+  }
+  i
+}
+
+fn Roundtrip.main(self: Roundtrip) -> Result<Unit, IoError> {
+  let paths = documents(self.root)?
+  var same = 0
+  for path in paths {
+    let text = read_text_file(self.root, path)?
+    let line = match read(text) {
+      Ok(document) => {
+        let again = write(document)
+        if again == text {
+          same = same + 1
+          "same " + path
+        } else {
+          "differs " + path + ": first difference at byte " + first_difference(text, again).to_text()
+        }
+      }
+      Err(error) => "refused " + path + ": " + error.describe()
+    }
+    Stdout.write_all((line + "\n").to_bytes())?
+  }
+  Stdout.write_all((same.to_text() + " of " + paths.len().to_text() + " documents byte-identical under " + self.root.absolute_path()? + "\n").to_bytes())?
+  if paths.is_empty() || same < paths.len() {
+    Process.exit(1)
+  }
+  Ok(())
+}
+
+system CirRoundtrip {
+  resource root: Directory { path = ".", flag = "--root" }
+
+  component roundtrip: Roundtrip {
+    root = root
+    executable = "cir-roundtrip"
+  }
+}
+
+// ---- tests -------------------------------------------------------------------------------
+
+// The refusal of `text` as `path: message`, or `read` when it is read.
+test fn refused(text: Text) -> Text = match read(text) {
+  Ok(_) => "read"
+  Err(error) => error.describe()
+}
+
+// A module of one constant `c` whose type is `t` and whose value is `value`, and one function
+// whose body is `body`.
+test fn document(t: Text, value: Text, body: Text) -> Text =
+  r#"{"format":"cir/1","name":"m","reader":{"language":"go","name":"codespec-read-go","version":"0.0.0"},"types":[],"consts":[{"name":"c","t":"# +
+  t + r#","value":"# + value + r#","pos":"m.go:3"}],"funcs":[{"name":"f","exported":false,"params":[],"results":[],"body":"# +
+  body + r#","pos":"m.go:5"}],"layout":["const:c","func:f"]}"#
+
+const BOOL: Text = r#"{"k":"bool"}"#
+const TRUE: Text = r#"{"k":"lit","value":"true","t":{"k":"bool"}}"#
+
+test "a well-formed document is read" {
+  assert refused(document(BOOL, TRUE, "[]")) == "read"
+}
+
+test "an unknown field is refused with its path" {
+  let value = r#"{"k":"lit","value":"true","t":{"k":"bool"},"width":"8"}"#
+  assert refused(document(BOOL, value, "[]")) == "$.consts[0].value.width: unknown field `width`"
+  let body = r#"[{"k":"return","results":[],"pos":"m.go:6","label":"done"}]"#
+  assert refused(document(BOOL, TRUE, body)) == "$.funcs[0].body[0].label: unknown field `label`"
+  let top = r#"{"format":"cir/1","name":"m","reader":{"language":"go","name":"r","version":"0"},"types":[],"funcs":[],"layout":[],"comment":""}"#
+  assert refused(top) == "$.comment: unknown field `comment`"
+  let twice = r#"{"format":"cir/1","name":"m","name":"n","reader":{"language":"go","name":"r","version":"0"},"types":[],"funcs":[],"layout":[]}"#
+  assert refused(twice) == "$.name: duplicate field `name`"
+}
+
+test "an unknown kind is refused with its path" {
+  assert refused(document(r#"{"k":"float","width":"64"}"#, TRUE, "[]")) == "$.consts[0].t.k: unknown kind `float` of Type"
+  let body = r#"[{"k":"goto","label":"out","pos":"m.go:6"}]"#
+  assert refused(document(BOOL, TRUE, body)) == "$.funcs[0].body[0].k: unknown kind `goto` of Stmt"
+  let value = r#"{"k":"lambda","t":{"k":"bool"}}"#
+  assert refused(document(BOOL, value, "[]")) == "$.consts[0].value.k: unknown kind `lambda` of Expr"
+  let width = r#"{"k":"int","width":"128","signed":true}"#
+  assert refused(document(width, TRUE, "[]")) == "$.consts[0].t.width: unknown value `128` of IntWidth"
+}
+
+test "an expression without a type is refused with its path" {
+  assert refused(document(BOOL, r#"{"k":"lit","value":"true"}"#, "[]")) == "$.consts[0].value: missing field `t`"
+  let body = r#"[{"k":"return","results":[{"k":"binop","op":"&&","x":{"k":"var","name":"a","t":{"k":"bool"}},"y":{"k":"var","name":"b"},"t":{"k":"bool"}}],"pos":"m.go:6"}]"#
+  assert refused(document(BOOL, TRUE, body)) == "$.funcs[0].body[0].results[0].y: missing field `t`"
+}
+
+test "a document of another format or not JSON is refused" {
+  let other = r#"{"format":"cir/2","name":"m"}"#
+  assert refused(other) == "$.format: format is `cir/2`, this reader reads `cir/1`"
+  assert refused(r#"{"name":"m"}"#) == "$: missing field `format`"
+  assert refused("[]") == "$: expected an object"
+  assert refused(r#"{"format":"cir/1""#) == "$: not JSON: unexpected end of input at byte 17"
+}
+
+// `lines` joined as a file: one newline after each.
+test fn text_of(lines: List<Text>) -> Text = lines.join("\n") + "\n"
+
+test "a document is written canonically" {
+  let input = r#"{"layout":[],"funcs":[],"types":[{"pos":"m.go:2","doc":"","fields":[],"exported":true,"name":"Empty","k":"struct"}],"reader":{"version":"1","name":"r","language":"go"},"name":"m","format":"cir/1","doc":"","consts":[],"facts":null}"#
+  let expected = text_of([
+    r"{",
+    r#"  "format": "cir/1","#,
+    r#"  "name": "m","#,
+    r#"  "reader": {"#,
+    r#"    "language": "go","#,
+    r#"    "name": "r","#,
+    r#"    "version": "1""#,
+    r"  },",
+    r#"  "types": ["#,
+    r"    {",
+    r#"      "k": "struct","#,
+    r#"      "name": "Empty","#,
+    r#"      "exported": true,"#,
+    r#"      "fields": [],"#,
+    r#"      "pos": "m.go:2""#,
+    r"    }",
+    r"  ],",
+    r#"  "funcs": [],"#,
+    r#"  "layout": []"#,
+    r"}"
+  ])
+  assert write(read(input)?) == expected
+}
+
+test "strings are escaped as codespec escapes them" {
+  let input = r#"{"format":"cir/1","name":"q\"b\\s\/\n\t\u0001\u007f é😀","reader":{"language":"go","name":"r","version":"0"},"types":[],"funcs":[],"layout":[]}"#
+  let written = write(read(input)?)
+  assert written.starts_with(text_of([r"{", r#"  "format": "cir/1","#, "  \"name\": \"q\\\"b\\\\s/\\n\\t\\u0001\u{7f} é😀\","]))
+}
+
+test "the optional members are written where codespec writes them" {
+  let input = r#"{"format":"cir/1","name":"m","reader":{"language":"go","name":"r","version":"0"},"types":[],"funcs":[{"name":"f","exported":false,"params":[],"results":[],"body":[{"k":"if","cond":{"k":"lit","value":"true","t":{"k":"bool"}},"then":[],"else":[{"k":"switch","cases":[],"pos":"m.go:4","tag":{"k":"var","name":"x","t":{"k":"bool"}}}],"pos":"m.go:3"},{"k":"assign","lhs":[],"rhs":[],"pos":"m.go:5","op":"+="}],"pos":"m.go:2","doc":"f does.","recv":{"name":"s","t":{"k":"named","name":"S"}}}],"layout":[],"refusals":[{"pos":"m.go:9","what":"go","reason":"r"}],"facts":{"displays":["S"],"shared":[]},"errors":[{"name":"E","message":"e","pos":"m.go:1"}],"doc":"m."}"#
+  let back = read(write(read(input)?))?
+  assert write(back) == write(read(input)?)
+  let compact = encode(parse(write(back))?)
+  assert compact == r#"{"format":"cir/1","name":"m","reader":{"language":"go","name":"r","version":"0"},"doc":"m.","types":[],"errors":[{"name":"E","message":"e","pos":"m.go:1"}],"funcs":[{"name":"f","exported":false,"recv":{"name":"s","t":{"k":"named","name":"S"}},"params":[],"results":[],"body":[{"k":"if","cond":{"k":"lit","value":"true","t":{"k":"bool"}},"then":[],"else":[{"k":"switch","tag":{"k":"var","name":"x","t":{"k":"bool"}},"cases":[],"pos":"m.go:4"}],"pos":"m.go:3"},{"k":"assign","op":"+=","lhs":[],"rhs":[],"pos":"m.go:5"}],"doc":"f does.","pos":"m.go:2"}],"layout":[],"facts":{"shared":[],"displays":["S"]},"refusals":[{"pos":"m.go:9","what":"go","reason":"r"}]}"#
+}
