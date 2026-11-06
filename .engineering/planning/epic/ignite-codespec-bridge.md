@@ -2,9 +2,13 @@
 format: aep.planning-md/3
 id: epic:ignite-codespec-bridge
 kind: epic
-status: draft
+status: implemented
 title: Ignite and codespec, both directions
-revision: 4
+revision: 7
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-06T05:09:24Z", actor: "human:timo", revision: 5}
+- {from: "proposed", to: "active", at: "2026-11-06T05:09:24Z", actor: "human:timo", revision: 6}
+- {from: "active", to: "implemented", at: "2026-11-06T05:09:24Z", actor: "human:timo", revision: 7}
 ---
 # Epic: ignite-codespec-bridge
 

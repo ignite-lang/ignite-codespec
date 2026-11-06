@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-06T05:09:21Z",
+  "actor": "human:timo",
+  "artifact": "story:ignite-round-trip",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check on feat/ignite-round-trip d813ae6: harness 200x300 byte-equal over original, reference, ignite, roundtrip; fixed point cmp; 5 adversary cases refused; EXIT=0",
+    "reference": "d813ae6"
+  }
+}

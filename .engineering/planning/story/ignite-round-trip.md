@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:ignite-round-trip
 kind: story
-status: active
+status: implemented
 title: Ignite to cir/1 to Ignite
 relations:
 - decomposes: epic:ignite-codespec-bridge
@@ -17,10 +17,11 @@ scope:
   path: examples/ledger/harness.toml
 - confidence: cited
   path: src/write.ignite
-revision: 10
+revision: 11
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"review_outcome":2}}}
 - {from: "proposed", to: "active", at: "2026-11-06T04:39:51Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"review_outcome":2}}}
+- {from: "active", to: "implemented", at: "2026-11-06T05:09:21Z", actor: "human:timo", revision: 11, decided_on: {"recorded":{"test_result":1,"review_outcome":2}}}
 ---
 # Story: ignite-round-trip
 
