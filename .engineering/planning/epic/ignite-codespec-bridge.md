@@ -4,7 +4,7 @@ id: epic:ignite-codespec-bridge
 kind: epic
 status: draft
 title: Ignite and codespec, both directions
-revision: 2
+revision: 3
 ---
 # Epic: ignite-codespec-bridge
 
@@ -17,7 +17,7 @@ Code moves between Ignite and every language codespec reads or writes, in both d
 - Requested by Timo, 2026-11-06: "we need 1.) codespec -> ignite and 2.) ignite -> codespec", in a new public repository, written in Ignite.
 - Design and mapping: `docs/design.md`.
 - Milestone C2 lives in ignite-lang/ignite as `story:typed-program-json`; this store cannot hold an edge to it.
-- External prerequisite: codespec's harness and writers are on its branch `m1-writers-harness` (3b2f6eb), not yet on its main.
+- External prerequisite: codespec's harness and writers are on its branch `m1-writers-harness` (harness b73ffce, Rust writer 3b2f6eb), not yet on its main.
 
 ## Acceptance
 
