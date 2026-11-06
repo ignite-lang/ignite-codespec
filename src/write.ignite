@@ -1,13 +1,15 @@
 package codespec
 
-import std.json.{Json, parse, get, encode, quote}
+import std.json.{Json, encode, quote}
 import std.fs.{write_text_file, join_path}
 import std.text.{split, contains, ends_with, is_digit}
 import std.io.IoError
 import codespec.cir.{
   CirModule, Facts, Func, Param, Field, Stmt, Expr, Type, TypeDecl, IntWidth, ChanDir, Case,
-  ReadError, describe
+  describe
 }
+import codespec.cir_json.{read}
+import codespec.util.{has, cut}
 
 // `codespec-write-ignite`: reads one cir/1 module, with the facts of `codespec pass`, on
 // standard input and writes it as one Ignite module into the output directory named by its
@@ -21,7 +23,7 @@ import codespec.cir.{
 // | cir/1 | Ignite | decided by |
 // |---|---|---|
 // | module `m` | `package codespec.m`, the sibling `m.ignite` of a program in `package codespec` | — |
-// | `int` (`platform`, 64, signed) | `Int`; `+`, `-`, `++`, `--` through `wrapping_add` and `wrapping_sub`, which wrap as Go does | — |
+// | `int` (`platform`, 64, signed) | `Int`; `+`, `-`, `++`, `--` through `Int.wrapping_add` and `Int.wrapping_sub`, which wrap as Go does | — |
 // | other integer widths, `*`, `/`, `%`, bit operators | refused | — |
 // | `bool`, `string`, `unit` | `Bool`, `Text`, `Unit` | — |
 // | `slice`, `map` | `List<T>`, `Map<K, V>` (keys `Int`, `Bool`, `Text`, an enum or a newtype of those) | — |
@@ -40,8 +42,9 @@ import codespec.cir.{
 // only in a function that writes no slice or map element and appends to none, so that neither
 // name can see a write through the other.
 //
-// This file is a program file (package `codespec`) importing the sibling `codespec.cir`, as
-// `cir_json.ignite` is: `ignite test` runs no test of a sibling module.
+// This file is a program file (package `codespec`) importing the siblings `codespec.cir` and
+// `codespec.util`, and the strict cir/1 reader, `read`, from the program file `cir_json.ignite`
+// as the module `codespec.cir_json`.
 
 // ---- the executable ----------------------------------------------------------------------
 
@@ -120,24 +123,6 @@ system CodespecWriteIgnite {
   }
 }
 
-// The module of the cir/1 document `text`, read strictly (`cir_json.ignite`'s `read`).
-fn read(text: Text) -> Result<CirModule, ReadError> {
-  let value = match parse(text) {
-    Ok(value) => value
-    Err(e) => return Err(ReadError { path = "$", message = "not JSON: " + e.message + " at byte " + e.offset.to_text() })
-  }
-  match get(value, "format") {
-    Some(Json.Str(format)) => {
-      if format != "cir/1" {
-        return Err(ReadError { path = "$.format", message = "format is `" + format + "`, this writer reads `cir/1`" })
-      }
-    }
-    Some(_) => return Err(ReadError { path = "$.format", message = "expected a string" })
-    Option.None => return Err(ReadError { path = "$", message = "missing field `format`" })
-  }
-  CirModule.from_json(value, "$")
-}
-
 // ---- results -----------------------------------------------------------------------------
 
 // A declaration left out of the output: its layout key (`type:T`, `func:K`), the position
@@ -173,17 +158,6 @@ fn refusals_json(refusals: List<Refusal>) -> Text {
 }
 
 // ---- text and names ----------------------------------------------------------------------
-
-fn has(names: List<Text>, name: Text) -> Bool {
-  for n in names {
-    if n == name {
-      return true
-    }
-  }
-  false
-}
-
-fn cut(text: Text, start: Int, end: Int) -> Text = text.to_bytes().slice(start, end).to_text()
 
 fn is_upper(b: Byte) -> Bool = b >= b'A' && b <= b'Z'
 
@@ -1127,7 +1101,7 @@ fn val(fx: Fx, e: Expr) -> Result<Ex, Text> = match e {
     "!" => Ok(Ex { text = "!" + paren(val(fx, u.x)?, PREFIX), prec = PREFIX })
     "+" => val(fx, u.x)
     "-" => if is_int_like(fx.w, type_of(u.x)) {
-      Ok(atom("wrapping_sub(0, " + val(fx, u.x)?.text + ")"))
+      Ok(atom("0.wrapping_sub(" + val(fx, u.x)?.text + ")"))
     } else {
       Err("unary - on " + type_name(type_of(u.x)))
     }
@@ -1251,12 +1225,12 @@ fn binop(fx: Fx, op: Text, x: Expr, y: Expr) -> Result<Ex, Text> {
     "+" => if is_text(w, xt) {
       Ok(Ex { text = paren(a, ADD) + " + " + paren(b, ADD + 1), prec = ADD })
     } else if is_int_like(w, xt) {
-      Ok(atom("wrapping_add(" + a.text + ", " + b.text + ")"))
+      Ok(atom(paren(a, ATOM) + ".wrapping_add(" + b.text + ")"))
     } else {
       Err("binary + on " + type_name(xt))
     }
     "-" => if is_int_like(w, xt) {
-      Ok(atom("wrapping_sub(" + a.text + ", " + b.text + ")"))
+      Ok(atom(paren(a, ATOM) + ".wrapping_sub(" + b.text + ")"))
     } else {
       Err("binary - on " + type_name(xt))
     }
@@ -1694,7 +1668,7 @@ fn step(fx: Fx, x: Expr, helper: Text) -> Result<Text, Text> {
     return Err("++ or -- on a value that is not an integer")
   }
   let p = place(fx, x)?
-  Ok(p + " = " + helper + "(" + val(fx, x)?.text + ", 1)")
+  Ok(p + " = " + paren(val(fx, x)?, ATOM) + "." + helper + "(1)")
 }
 
 fn if_stmt(fx: Fx, cond: Expr, then: List<Stmt>, otherwise: List<Stmt>, pos: Text) -> Result<List<Text>, Refuse> {
@@ -2386,13 +2360,6 @@ fn write(m: CirModule) -> Result<Written, Text> {
     Some(lines) => tail.push(lines)
     None => {}
   }
-  let sub = contains(body, "wrapping_sub(")
-  if sub || contains(body, "wrapping_add(") {
-    tail.push(WRAPPING_ADD)
-  }
-  if sub {
-    tail.push(WRAPPING_SUB)
-  }
   if contains(body, ") in unordered(") {
     tail.push(UNORDERED)
   }
@@ -2511,29 +2478,6 @@ const UNORDERED: List<Text> = [
   "fn unordered<T>(m: T) -> T = m"
 ]
 
-const WRAPPING_ADD: List<Text> = [
-  "// Go's integer addition, which wraps on overflow where Ignite's fails.",
-  "fn wrapping_add(a: Int, b: Int) -> Int " + r"{",
-  "  if b > 0 && a > 9223372036854775807 - b " + r"{",
-  "    return (a + (-9223372036854775808)) + (b + (-9223372036854775808))",
-  "  " + r"}",
-  "  if b < 0 && a < (-9223372036854775808) - b " + r"{",
-  "    return (a - (-9223372036854775808)) + (b - (-9223372036854775808))",
-  "  " + r"}",
-  "  a + b",
-  r"}"
-]
-
-const WRAPPING_SUB: List<Text> = [
-  "// Go's integer subtraction, which wraps on overflow where Ignite's fails.",
-  "fn wrapping_sub(a: Int, b: Int) -> Int " + r"{",
-  "  if b == -9223372036854775808 " + r"{",
-  "    return if a >= 0 " + r"{" + " a + (-9223372036854775808) " + r"}" + " else " + r"{" + " a - (-9223372036854775808) " + r"}",
-  "  " + r"}",
-  "  wrapping_add(a, -b)",
-  r"}"
-]
-
 // ---- tests -------------------------------------------------------------------------------
 
 test "names follow Ignite's conventions" {
@@ -2625,9 +2569,14 @@ test "integer + and - wrap as Go's do" {
   let add = r#"{"k":"binop","op":"+","x":"# + var_of("a", INT) + r#","y":"# + var_of("b", INT) + r#","t":"# + INT + r#"}"#
   let f = func_of("Add", param("a", INT) + "," + param("b", INT), INT, ret(add, "m.go:4"))
   let source = source_of(module_of("", f, r#""func:Add""#, NO_FACTS))
-  assert contains(source, "\n\nfn add(a: Int, b: Int) -> Int {{\n  return wrapping_add(a, b)\n}}\n\n")
-  assert contains(source, "fn wrapping_add(a: Int, b: Int) -> Int {{")
+  assert contains(source, "\n\nfn add(a: Int, b: Int) -> Int {{\n  return a.wrapping_add(b)\n}}\n")
+  assert !contains(source, "fn wrapping_add(")
   assert !contains(source, "fn wrapping_sub(")
+  let neg = r#"{"k":"unop","op":"-","x":"# + var_of("b", INT) + r#","t":"# + INT + r#"}"#
+  let sub = r#"{"k":"binop","op":"-","x":"# + add + r#","y":"# + neg + r#","t":"# + INT + r#"}"#
+  let g = func_of("Sub", param("a", INT) + "," + param("b", INT), INT, ret(sub, "m.go:8"))
+  let source_sub = source_of(module_of("", g, r#""func:Sub""#, NO_FACTS))
+  assert contains(source_sub, "\n\nfn sub(a: Int, b: Int) -> Int {{\n  return a.wrapping_add(b).wrapping_sub(0.wrapping_sub(b))\n}}\n")
   assert source.starts_with("package codespec.m\n\n// Code generated by codespec-write-ignite from cir/1. DO NOT EDIT.\n\n")
 }
 
@@ -2734,5 +2683,5 @@ test "a method that writes its pointer receiver returns it" {
   let get = r#"{"name":"N","exported":true,"recv":{"name":"c","t":"# + ptr + r#"},"params":[],"results":["# + INT + r#"],"body":["# + ret(field, "m.go:6") + r#"],"pos":"m.go:5"}"#
   let facts = r#"{"shared":[],"read_only":["Counter.N"]}"#
   let source = source_of(module_of(c, inc + "," + get, r#""type:Counter","func:Counter.Inc","func:Counter.N""#, facts))
-  assert contains(source, "type Counter {{\n  n: Int\n}}\n\nfn Counter.inc(c: Counter) -> Counter {{\n  var c = c\n  c.n = wrapping_add(c.n, 1)\n  c\n}}\n\nfn Counter.n(c: Counter) -> Int {{\n  return c.n\n}}\n")
+  assert contains(source, "type Counter {{\n  n: Int\n}}\n\nfn Counter.inc(c: Counter) -> Counter {{\n  var c = c\n  c.n = c.n.wrapping_add(1)\n  c\n}}\n\nfn Counter.n(c: Counter) -> Int {{\n  return c.n\n}}\n")
 }

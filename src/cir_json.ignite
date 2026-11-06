@@ -18,8 +18,8 @@ import codespec.cir.{CirModule, ReadError, describe}
 // escaped as serde_json escapes them, and a final newline.
 //
 // This file is also the executable `cir-roundtrip` (`task roundtrip-check`), and it is a
-// program file (package `codespec`), not a sibling module: `ignite test` runs no test of a
-// sibling module, and a sibling module given to it as a file cannot import its siblings.
+// program file (package `codespec`), not a sibling module; `read.ignite` and `write.ignite`
+// import it as the module `codespec.cir_json`.
 
 const FORMAT: Text = "cir/1"
 
