@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-06T03:13:41Z",
+  "actor": "human:timo",
+  "artifact": "story:ignite-writer",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check on feat/ignite-writer 5a721ce: harness 200 seeds byte-equal (original, reference, ignite), writer tests 15 ok, adversary cases green, EXIT=0",
+    "reference": "5a721ce"
+  }
+}
