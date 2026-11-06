@@ -1,0 +1,10 @@
+version: "3"
+
+vars:
+  IGNITE: '{{.IGNITE | default "ignite"}}'
+
+tasks:
+  check:
+    desc: Check every Ignite source file
+    cmds:
+      - for f in $(find src tools -name '*.ignite' 2>/dev/null); do {{.IGNITE}} check "$f" || exit 1; done
