@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-06T04:39:51Z",
+  "actor": "human:timo",
+  "artifact": "story:ignite-reader",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check on feat/ignite-reader 1023f4d (ignite f64d0f1): reader 11 ok, reader-values 18 refusals cmp, reader-builds Go harness byte-equal, ledger harness 200x300 byte-equal, EXIT=0",
+    "reference": "1023f4d"
+  }
+}
