@@ -7,28 +7,36 @@ title: The cir/1 model in Ignite, generated from codespec's schema
 relations:
 - decomposes: epic:ignite-codespec-bridge
 scope:
+- confidence: cited
+  path: Taskfile.yml
+- confidence: cited
+  path: codespec.pin
 - confidence: inferred
   path: src/cir.ignite
+- confidence: cited
+  path: src/cir_json.ignite
 - confidence: inferred
   path: tools/gen_model.ignite
-revision: 3
+revision: 8
 ---
 # Story: cir-model
 
 ## Outcome
 
-C0: `tools/gen_model.ignite` generates `src/cir.ignite` from codespec's `schemas/cir-1.schema.json` at a pinned commit; strict reading and canonical writing of `cir/1` documents.
+C0: `tools/gen_model.ignite` generates `src/cir.ignite` from codespec's `schemas/cir-1.schema.json` at the codespec commit pinned in `codespec.pin`; `src/cir_json.ignite` reads `cir/1` documents strictly and writes them canonically.
 
 ## Context
 
-- `docs/design.md` (2026-11-06).
+- `docs/design.md` section 2.
+- The checked-in codespec documents are `examples/orders/orders.read.cir.json` on main and `orders.cir.json` on `m1-writers-harness`; the pin names the commit both are read from.
 
 ## Acceptance
 
-- Every checked-in codespec example document is read and re-encoded to the same bytes, on both Ignite targets.
-- A document with an unknown field, an unknown kind or an expression without a type is refused with its JSON path.
-- `task check` green.
+- `task model-check` regenerates `src/cir.ignite` from the pinned schema and fails if the file differs from the checked-in one by one byte.
+- `task roundtrip-check` reads every `*.cir.json` of the pinned codespec commit's `examples/`, re-encodes it, and fails unless the bytes are equal; on the LLVM target (the default).
+- Inline tests in `src/cir_json.ignite` refuse a document with an unknown field, an unknown kind and an expression without a type, each with its JSON path in the error.
+- `task check` runs both tasks and the inline tests, and is green.
 
 ## Out of Scope
 
-- The other milestones of `docs/design.md` section 6.
+- The writer and the reader.

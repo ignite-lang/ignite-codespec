@@ -8,23 +8,28 @@ relations:
 - decomposes: epic:ignite-codespec-bridge
 - depends_on: story:ignite-writer
 - depends_on: story:ignite-reader
-revision: 1
+scope:
+- confidence: cited
+  path: Taskfile.yml
+- confidence: cited
+  path: examples/ledger/harness.toml
+revision: 4
 ---
 # Story: ignite-round-trip
 
 ## Outcome
 
-C4: an Ignite example read by `codespec-read-ignite` and written back by `codespec-write-ignite` behaves the same.
+C4: `examples/ledger/reference.ignite` read by `codespec-read-ignite` and written back by `codespec-write-ignite` behaves the same as the original.
 
 ## Context
 
-- `docs/design.md` (2026-11-06).
+- `docs/design.md` section 6, C4.
 
 ## Acceptance
 
-- The harness finds the original and the round-tripped program byte-equal on the seeded traces.
-- `task check` green.
+- `task roundtrip` writes `examples/ledger/out/roundtrip.ignite`, and `codespec harness examples/ledger --seeds 200 --commands 300` with the implementations `reference` (the hand-written Ignite) and `roundtrip` reports byte-equal output on all 200 seeds.
+- `task check` runs it and is green.
 
 ## Out of Scope
 
-- The other milestones of `docs/design.md` section 6.
+- Examples other than `examples/ledger`.
