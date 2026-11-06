@@ -1,0 +1,41 @@
+package buildsdriver.builds
+
+// Adversary cases of `codespec-read-ignite` (story ignite-reader): Ignite programs the reader
+// reads without a refusal whose cir/1 module Go cannot build. The harness of this example runs
+// this file and the Go that `codespec write --lang go` writes from the reader's document; the
+// inline test pins Ignite's values.
+
+enum Color {
+  Red
+  Green
+}
+
+type Pair {
+  xs: List<Int>
+}
+
+// `len` of a text, list or map read as a 64-bit int; Go's `len` is `int`.
+fn size(xs: List<Int>) -> Int = xs.len()
+
+// An exhaustive `match` as a function's last expression: no arm is missing, so nothing follows.
+fn name(c: Color) -> Text = match c {
+  Red => "red"
+  Green => "green"
+}
+
+// A `let` that shadows one of the same block.
+fn bump(a: Int) -> Int {
+  let x = a
+  let x = x + 1
+  x
+}
+
+// Records and lists compare by value in Ignite.
+fn same(a: Pair, b: Pair) -> Bool = a == b
+
+test "the values Ignite gives" {
+  assert size([1, 2, 3]) == 3
+  assert name(Green) == "green"
+  assert bump(1) == 2
+  assert same(Pair { xs = [1] }, Pair { xs = [1] })
+}

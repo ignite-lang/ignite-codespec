@@ -1,0 +1,9 @@
+[[implementation]]
+name = "original"
+build = ["ignite", "build", "drivers/ignite/driver.ignite", "--out", "{build}/original"]
+run = ["{build}/original/bin/values-ignite"]
+
+[[implementation]]
+name = "read"
+build = ["go", "build", "-C", "drivers/go", "-overlay", "overlay-read.json", "-o", "{build}/read", "."]
+run = ["{build}/read"]

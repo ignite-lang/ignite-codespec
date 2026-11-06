@@ -1,0 +1,82 @@
+package valuesdriver.values
+
+// Adversary cases of `codespec-read-ignite` (story ignite-reader): Ignite programs the reader
+// reads without a refusal whose cir/1 module means something else. The harness of this example
+// runs this file and the Go that `codespec write --lang go` writes from the reader's document
+// (`codespec pass` between) and compares their output; the inline test pins Ignite's values.
+
+type Bag {
+  items: Map<Text, Int>
+  list: List<Int>
+}
+
+fn count(m: Map<Text, Int>) -> Int {
+  var c = 0
+  for (_, v) in m {
+    c = c + v - v + 1
+  }
+  c
+}
+
+// A list is a value in Ignite: `b` and `c` are copies of `a`.
+fn alias_list() -> Int {
+  var a: List<Int> = []
+  a.push(1)
+  a.push(2)
+  a.push(3)
+  var b = a
+  b.push(9)
+  var c = a
+  c.push(7)
+  b[3]
+}
+
+// A map is a value in Ignite: a change of the copy `k` leaves `m` alone.
+fn alias_map() -> Int {
+  var m: Map<Text, Int> = Map.empty()
+  m.put("a", 1)
+  var k = m
+  k.put("b", 2)
+  count(m)
+}
+
+fn fill(m: Map<Text, Int>) -> Int {
+  var k = m
+  k.put("x", 1)
+  count(k)
+}
+
+// A callee's change of its argument does not reach the caller.
+fn param_map() -> Int {
+  var m: Map<Text, Int> = Map.empty()
+  let filled = fill(m)
+  count(m) + filled - filled
+}
+
+// A record holding a map is copied with its map.
+fn record_map() -> Int {
+  var a = Bag { items = Map.empty(), list = [] }
+  var b = a
+  b.items.put("x", 1)
+  count(a.items)
+}
+
+// `match` takes the first arm that matches: a catch-all arm before a literal wins.
+fn arm_wild(x: Int) -> Text = match x {
+  _ => "any"
+  1 => "one"
+}
+
+fn arm_bind(x: Int) -> Text = match x {
+  other => "any {other}"
+  1 => "one"
+}
+
+test "the values Ignite gives" {
+  assert alias_list() == 9
+  assert alias_map() == 1
+  assert param_map() == 0
+  assert record_map() == 0
+  assert arm_wild(1) == "any"
+  assert arm_bind(1) == "any 1"
+}

@@ -21,6 +21,32 @@ tasks:
     cmds:
       - task: test-reader
       - task: read-ledger
+      - task: reader-values
+      - task: reader-builds
+
+  reader-builds:
+    desc: Read examples/reader-builds/source/builds.ignite, pass and write it as Go, and run the Go against the Ignite original in the harness; the Go must build and the outputs must be byte-equal
+    cmds:
+      - task: reader-adapter
+      - '{{.IGNITE}} test examples/reader-builds/source/builds.ignite --out target/reader-builds/test'
+      - mkdir -p target/reader-builds/bin
+      - ln -sf "$(realpath "$(command -v {{.IGNITE}})")" target/reader-builds/bin/ignite
+      - PATH="$PWD/target/reader-builds/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/reader-builds/source/builds.ignite --out target/reader-builds/builds.cir.json --adapters target/adapters
+      - '{{.CODESPEC}} pass target/reader-builds/builds.cir.json --out target/reader-builds/builds.facts.json'
+      - '{{.CODESPEC}} write --lang go target/reader-builds/builds.facts.json --out target/reader-builds/go --adapters {{.ADAPTERS}}'
+      - PATH="$PWD/target/reader-builds/bin:$PATH" {{.CODESPEC}} harness examples/reader-builds --seeds 1 --commands 1 --build-dir target/reader-builds/harness
+
+  reader-values:
+    desc: Read examples/reader-values/source/values.ignite, pass and write it as Go, and run the Go against the Ignite original in the harness; the outputs must be byte-equal
+    cmds:
+      - task: reader-adapter
+      - '{{.IGNITE}} test examples/reader-values/source/values.ignite --out target/reader-values/test'
+      - mkdir -p target/reader-values/bin
+      - ln -sf "$(realpath "$(command -v {{.IGNITE}})")" target/reader-values/bin/ignite
+      - PATH="$PWD/target/reader-values/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/reader-values/source/values.ignite --out target/reader-values/values.cir.json --adapters target/adapters
+      - '{{.CODESPEC}} pass target/reader-values/values.cir.json --out target/reader-values/values.facts.json'
+      - '{{.CODESPEC}} write --lang go target/reader-values/values.facts.json --out target/reader-values/go --adapters {{.ADAPTERS}}'
+      - PATH="$PWD/target/reader-values/bin:$PATH" {{.CODESPEC}} harness examples/reader-values --seeds 1 --commands 1 --build-dir target/reader-values/harness
 
   reader-adapter:
     desc: Build codespec-read-ignite into target/adapters, the --adapters directory of codespec read --lang ignite
