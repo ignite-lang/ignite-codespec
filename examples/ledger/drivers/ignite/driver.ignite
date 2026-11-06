@@ -1,0 +1,115 @@
+package ledgerdriver
+
+import std.text.{lines, split}
+import ledgerdriver.ledger.{
+  Ledger, Order, Event, Step, LedgerError, label, message, place, pay, ship, cancel, get,
+  pending_orders, drain
+}
+
+// The harness driver of the Ignite ledger: reads a codespec harness trace on standard input and
+// prints one line per command result, then one line per event the call recorded, drained from
+// the ledger in order (codespec's crates/harness, the orders format). The ledger is the sibling
+// module `ledger`: `ledger.ignite` beside this file links to the implementation under test.
+
+type Driver {
+  executable: Text
+}
+
+fn Driver.main(self: Driver) -> Result<Unit, IoError> {
+  let trace = read_all()?.to_text()
+  var out: List<Text> = []
+  var ledger = Ledger.new()
+  var started = false
+  var number = 0
+  for line in trace.lines() {
+    number = number + 1
+    let f = line.split(" ")
+    let command = f[0]
+    if command != "new" && !started {
+      return fail(number, "command before new")
+    }
+    if command == "new" && f.len() == 1 {
+      ledger = Ledger.new()
+      started = true
+      out.push("new")
+    } else if command == "place" && f.len() == 4 {
+      let total = match Int.parse(f[2]) {
+        Some(n) => n
+        None => return fail(number, "total {f[2]} is not an int64")
+      }
+      let gift = match f[3] {
+        "true" => true
+        "false" => false
+        _ => return fail(number, "gift {f[3]} is not a bool")
+      }
+      let step = ledger.place(f[1], total, gift)
+      ledger = step.ledger
+      out.push(match step.result {
+        Ok(id) => "place ok {id}"
+        Err(error) => "place err {message(error)}"
+      })
+    } else if command == "pay" && f.len() == 2 {
+      let step = ledger.pay(f[1])
+      ledger = step.ledger
+      out.push(result("pay", step.result))
+    } else if command == "ship" && f.len() == 3 {
+      let step = ledger.ship(f[1], f[2])
+      ledger = step.ledger
+      out.push(result("ship", step.result))
+    } else if command == "cancel" && f.len() == 2 {
+      let step = ledger.cancel(f[1])
+      ledger = step.ledger
+      out.push(result("cancel", step.result))
+    } else if command == "get" && f.len() == 2 {
+      out.push(match ledger.get(f[1]) {
+        Some(o) => "get found {order(o)}"
+        None => "get missing"
+      })
+    } else if command == "pending" && f.len() == 1 {
+      let pending = ledger.pending_orders()
+      out.push("pending {pending.len()}" + pending.map(|o| " | " + order(o)).join(""))
+    } else {
+      return fail(number, "unknown command {line.debug()}")
+    }
+    let (drained, events) = ledger.drain()
+    ledger = drained
+    for e in events {
+      out.push(event(e))
+    }
+  }
+  Stdout.write_all(out.map(|l| l + "\n").join("").to_bytes())
+}
+
+fn read_all() -> Result<Bytes, IoError> requires [stdin.read] {
+  var data = Bytes.empty()
+  loop {
+    match Stdin.read(65536)? {
+      Eof => return Ok(data)
+      Data(more) => data.append(more)
+    }
+  }
+}
+
+fn result(command: Text, outcome: Result<Unit, LedgerError>) -> Text = match outcome {
+  Ok(_) => "{command} ok"
+  Err(error) => "{command} err {message(error)}"
+}
+
+fn order(o: Order) -> Text =
+  "id={o.id} customer={o.customer} total={o.total} status={label(o.status)} tracking={o.tracking} gift={o.gift}"
+
+fn event(e: Event) -> Text = match e {
+  OrderPlaced(id, customer, total) => "event OrderPlaced id={id} customer={customer} total={total}"
+  OrderPaid(id) => "event OrderPaid id={id}"
+  OrderShipped(id, tracking) => "event OrderShipped id={id} tracking={tracking}"
+  OrderCancelled(id) => "event OrderCancelled id={id}"
+}
+
+fn fail(number: Int, reason: Text) -> Result<Unit, IoError> =
+  Err(IoError.new("driver: trace line {number}: {reason}").with_exit_code(2))
+
+system Harness {
+  component driver: Driver {
+    executable = "ledger-reference"
+  }
+}

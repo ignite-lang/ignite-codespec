@@ -1,0 +1,174 @@
+package ledgerdriver.ledger
+
+// The ledger of `examples/ledger/source/ledger.go`, written by hand in idiomatic Ignite: it takes,
+// pays, ships and cancels customer orders. A ledger is a value; every call takes one and returns
+// the ledger after it with the call's result (`Step`), and the events a call records stay in the
+// ledger until `drain` takes them. The package is the driver's (`drivers/ignite/driver.ignite`),
+// which sees this file as its sibling `ledger` through the link `drivers/ignite/ledger.ignite`.
+
+enum Status {
+  Pending
+  Paid
+  Shipped
+  Cancelled
+}
+
+type Order {
+  id: Text
+  customer: Text
+  total: Int
+  status: Status
+  tracking: Text = ""
+  gift: Bool
+}
+
+enum LedgerError {
+  InvalidTotal
+  NoOrder(Text)
+  WrongState(Status)
+}
+
+// One change of the ledger: `OrderPlaced(id, customer, total)`, `OrderShipped(id, tracking)`.
+enum Event {
+  OrderPlaced(Text, Text, Int)
+  OrderPaid(Text)
+  OrderShipped(Text, Text)
+  OrderCancelled(Text)
+}
+
+type Ledger {
+  orders: Map<Text, Order>
+  events: List<Event>
+  seq: Int
+}
+
+// The ledger after a call and what the call returned.
+type Step<T> {
+  ledger: Ledger
+  result: Result<T, LedgerError>
+}
+
+fn Ledger.new() -> Ledger = Ledger { orders = Map.empty(), events = [], seq = 0 }
+
+fn label(status: Status) -> Text = match status {
+  Pending => "pending"
+  Paid => "paid"
+  Shipped => "shipped"
+  Cancelled => "cancelled"
+}
+
+fn message(error: LedgerError) -> Text = match error {
+  InvalidTotal => "total must be positive"
+  NoOrder(id) => "no order {id}"
+  WrongState(status) => "order is {label(status)}"
+}
+
+fn place(ledger: Ledger, customer: Text, total: Int, gift: Bool) -> Step<Text> {
+  if total <= 0 {
+    return Step { ledger, result = Err(InvalidTotal) }
+  }
+  var next = ledger
+  next.seq = next.seq + 1
+  let id = "o-{next.seq}"
+  next.orders.put(id, Order { id, customer, total, status = Pending, gift })
+  next.events.push(OrderPlaced(id, customer, total))
+  Step { ledger = next, result = Ok(id) }
+}
+
+fn pay(ledger: Ledger, id: Text) -> Step<Unit> = match find(ledger, id) {
+  Err(error) => refused(ledger, error)
+  Ok(order) => match order.status {
+    Pending => recorded(ledger, Order { status = Paid, ..order }, OrderPaid(id))
+    status => refused(ledger, WrongState(status))
+  }
+}
+
+fn ship(ledger: Ledger, id: Text, tracking: Text) -> Step<Unit> = match find(ledger, id) {
+  Err(error) => refused(ledger, error)
+  Ok(order) => match order.status {
+    Paid => recorded(ledger, Order { status = Shipped, tracking, ..order }, OrderShipped(id, tracking))
+    status => refused(ledger, WrongState(status))
+  }
+}
+
+fn cancel(ledger: Ledger, id: Text) -> Step<Unit> = match find(ledger, id) {
+  Err(error) => refused(ledger, error)
+  Ok(order) => match order.status {
+    Pending | Paid => recorded(ledger, Order { status = Cancelled, ..order }, OrderCancelled(id))
+    status => refused(ledger, WrongState(status))
+  }
+}
+
+fn get(ledger: Ledger, id: Text) -> Option<Order> = ledger.orders.get(id)
+
+// The pending orders in id order: a `Map` iterates in key order.
+fn pending_orders(ledger: Ledger) -> List<Order> {
+  var out: List<Order> = []
+  for (_, order) in ledger.orders {
+    if order.status == Pending {
+      out.push(order)
+    }
+  }
+  out
+}
+
+// The events recorded since the last drain, oldest first, and the ledger without them.
+fn drain(ledger: Ledger) -> (Ledger, List<Event>) {
+  var next = ledger
+  next.events = []
+  (next, ledger.events)
+}
+
+fn find(ledger: Ledger, id: Text) -> Result<Order, LedgerError> = match ledger.orders.get(id) {
+  Some(order) => Ok(order)
+  None => Err(NoOrder(id))
+}
+
+fn refused(ledger: Ledger, error: LedgerError) -> Step<Unit> = Step { ledger, result = Err(error) }
+
+fn recorded(ledger: Ledger, order: Order, event: Event) -> Step<Unit> {
+  var next = ledger
+  next.orders.put(order.id, order)
+  next.events.push(event)
+  Step { ledger = next, result = Ok(()) }
+}
+
+test "an order goes from pending to paid to shipped" {
+  let placed = Ledger.new().place("alice", 5, true)
+  assert placed.result == Ok("o-1")
+  let paid = placed.ledger.pay("o-1")
+  assert paid.result == Ok(())
+  let shipped = paid.ledger.ship("o-1", "TRK")
+  assert shipped.result == Ok(())
+  let order = shipped.ledger.get("o-1")?
+  assert order.status == Shipped && order.tracking == "TRK" && order.gift
+  let (drained, events) = shipped.ledger.drain()
+  assert events == [OrderPlaced("o-1", "alice", 5), OrderPaid("o-1"), OrderShipped("o-1", "TRK")]
+  assert drained.events == []
+}
+
+test "refusals carry the texts of the Go errors" {
+  let ledger = Ledger.new()
+  let none = ledger.place("bob", 0, false)
+  assert none.result == Err(InvalidTotal) && none.ledger.seq == 0
+  assert message(InvalidTotal) == "total must be positive"
+  assert ledger.pay("o-1").result == Err(NoOrder("o-1"))
+  assert message(NoOrder("x")) == "no order x"
+  let placed = ledger.place("bob", 9223372036854775807, false).ledger
+  assert placed.ship("o-1", "t").result == Err(WrongState(Pending))
+  let cancelled = placed.cancel("o-1").ledger
+  assert cancelled.cancel("o-1").result == Err(WrongState(Cancelled))
+  assert message(WrongState(Cancelled)) == "order is cancelled"
+}
+
+test "pending orders come in id order" {
+  var ledger = Ledger.new()
+  var n = 0
+  while n < 11 {
+    ledger = ledger.place("c", 1, false).ledger
+    n = n + 1
+  }
+  ledger = ledger.pay("o-3").ledger
+  let ids = ledger.pending_orders().map(|o| o.id)
+  assert ids == ["o-1", "o-10", "o-11", "o-2", "o-4", "o-5", "o-6", "o-7", "o-8", "o-9"]
+}

@@ -14,8 +14,13 @@ Ignite adapters for codespec's `cir/1`: `codespec-write-ignite` (`cir/1` → Ign
 
 ## Rules
 
-- Written in Ignite. No Rust, Go or Python in this repository; Bash only for one-line invocations
-  in `Taskfile.yml`.
+- Written in Ignite. No Rust or Python in this repository; Bash only for one-line invocations in
+  `Taskfile.yml`. Go only as test input: a package under `examples/*/source/` (read by `codespec
+  read --lang go`) and its harness driver under `examples/*/drivers/go/`, nowhere else.
+- `examples/<name>/harness.toml` is codespec's harness manifest; `task harness` runs it with the
+  `ignite` of the `IGNITE` var first on `PATH`, so an entry builds with a bare `ignite`. An Ignite
+  driver sees the implementation under test as its sibling module through a symbolic link beside
+  it (`examples/ledger/drivers/ignite/ledger.ignite`).
 - `src/cir.ignite` is generated from the pinned schema by `tools/gen_model.ignite`; never edit it by
   hand, regenerate it with the generator change.
 - Strict reading, canonical writing, deterministic output: the same input gives the same bytes.
