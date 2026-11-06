@@ -49,7 +49,7 @@ and a reason; nothing is approximated. "Verified" rows cite the Ignite contract 
 | `int {width: 64, signed: true}`, `int {width: platform}` | `Int` (i64) | verified, slice.md "`Int` → `i64`" |
 | other int widths | `Int` with the range checked at every conversion, or refused | inferred |
 | `bool`, `string`, `unit` | `Bool`, `Text`, `()` | inferred |
-| `slice`, `map`, `tuple` | `List<T>`, `Map<K, V>`, tuple | inferred; Ignite's `Map` iterates in key order, so a loop the `unordered_iteration` fact marks is written over sorted keys and the harness confirms the order does not reach the output |
+| `slice`, `map`, `tuple` | `List<T>`, `Map<K, V>`, tuple | inferred; Ignite's `Map` iterates in key order, so a loop the `unordered_iteration` fact marks is written `for (k, v) in unordered(m)`, in key order, and the harness confirms the order does not reach the output |
 | `named`, `struct`, `enum`, `union` | `type` records, enums, enums with data | inferred |
 | `ptr` to a value the `shared` fact clears | the value (Ignite has value semantics) | inferred |
 | `ptr` the `shared` fact marks, `chan`, `send`, `any` | refused | Ignite has no shared mutable reference and no channel |
@@ -80,6 +80,14 @@ and a reason; nothing is approximated. "Verified" rows cite the Ignite contract 
   construct and the reason. A refused type takes every declaration that mentions it, a refused
   function every caller. `cir/1` gives a struct field no position, so a field's refusal carries
   its struct's (`orders.go:52` for the field on line 53).
+- A function with results ends in a value: its body must end in Go's terminating statement (a
+  `return`, an `if` with `else`, a `switch` with `default`, each branch terminating). A
+  trailing `switch` without `default` that names every variant of its enum tag cannot fall
+  through, so its last case is written as the `else`; any other body that can end without
+  returning is refused at its last statement.
+- A loop over a map is written over `unordered(m)`, the identity the writer emits when used
+  (`fn unordered<T>(m: T) -> T = m`): it runs in key order and tells the reader that the order is
+  cir/1's unspecified one.
 - Checked by `task writer`: the ledger's output equals `examples/ledger/out/ignite/` and runs
   under `examples/ledger/drivers/ignite-out/` in the harness; orders' refusals equal
   `examples/orders-refusals.expected.json`.
@@ -128,7 +136,16 @@ capability resources; closures until `cir/1` has a node for them.
   in statement position. A name bound by a refused statement is refused where it is used, never
   read as an outer variable of the same name.
 - A loop over a map is refused: Ignite's runs in key order, cir/1's in none (codespec's
-  `unordered_iteration` fact marks a position; cir/1 has no ordered form).
+  `unordered_iteration` fact marks a position; cir/1 has no ordered form). A loop over
+  `unordered(m)`, the writer's helper, declares that its order is not part of the function, and
+  is read as cir/1's range over the map.
+- Inverse of the writer's other forms: `fn T.m(r: T, ..) -> T` or `-> (T, R)` whose body starts
+  `var r = r` and whose returns are `r` or `(r, v)` is the method with receiver `r *T` and the
+  results of `R`; `var r = r` is dropped, a bare `r` other than as the base of a field or a
+  write is refused (Go would share the pointer where Ignite copies), and a call of such a method
+  inside the module is refused. `enum Error`'s `V(V)` of a record `V` with `fn V.error` is the
+  error type `V`: `Error.V(v)` is `v` used as an error and `V.error` is the method `V.Error`.
+  `E.V` is the constant `V`; `E.value(x)` of an enum over `Text` is `sprintf("%s", x)`.
 - Exception, stated: Ignite's `Int` operators trap on overflow where cir/1's wrap. The two
   differ only on a program that traps, which is written as one that does not (`AGENTS.md`).
 - Known gap: the typed document resolves aliases, so a newtype's uses read as its underlying
@@ -138,7 +155,22 @@ capability resources; closures until `cir/1` has a node for them.
   refuses every case with its position and reason, the second's Go builds and matches Ignite in
   the harness.
 - `examples/ledger/reference.cir.json` is the reader's document of the ledger reference, kept
-  byte-equal by `task read-ledger`.
+  byte-equal by `task read-ledger`; its `refusals` are the reference's 10 refused declarations
+  and statements.
+
+### As round-tripped (C4, `task roundtrip`)
+
+- Input: the writer's ledger `examples/ledger/out/ignite/ledger.ignite`, Ignite that is cir/1
+  by construction. `examples/ledger/reference.ignite` is not the input: cir/1 has no node for
+  its generic `Step<T>`, its `match` on a union, its ordered map loop or its `Result` with
+  another error, so the reader refuses 10 of its declarations and statements, pinned in
+  `reference.cir.json`; those nodes are a request to codespec.
+- `codespec read --lang ignite` gives no refusal; `codespec pass`, then `codespec write --lang
+  ignite` gives `examples/ledger/out/roundtrip/ledger.ignite`, which `ignite check` passes and
+  which runs under `examples/ledger/drivers/roundtrip/` as the harness entry `roundtrip`.
+- It differs from its input only where cir/1 keeps less: doc comments are gone and the alias
+  `OrderID` reads as `Text`. Reading and writing it again gives the same bytes (the fixed
+  point `task roundtrip` checks).
 
 ## 5. Evidence
 

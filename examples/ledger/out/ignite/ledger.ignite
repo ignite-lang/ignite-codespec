@@ -151,7 +151,7 @@ fn Ledger.get(l: Ledger, id: OrderID) -> Option<Order> {
 // PendingOrders lists the pending orders in map order, which is random; the caller sorts them.
 fn Ledger.pending_orders(l: Ledger) -> List<Order> {
   var out: List<Order> = []
-  for (_, o) in l.orders {
+  for (_, o) in unordered(l.orders) {
     if o.status == Status.Pending {
       out.push(o)
     }
@@ -192,3 +192,6 @@ fn wrapping_add(a: Int, b: Int) -> Int {
   }
   a + b
 }
+
+// A map whose iteration order the source leaves unspecified; Ignite's runs in key order.
+fn unordered<T>(m: T) -> T = m

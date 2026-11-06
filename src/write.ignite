@@ -32,7 +32,7 @@ import codespec.cir.{
 // | last result `error`, function `fallible` | `Result<T, Error>`; `enum Error` holds the sentinels, the error structs and `Msg(Text)` for `errorf` | `fallible` |
 // | `(T, bool)`, function `comma_ok` | `Option<T>` | `comma_ok` |
 // | `lookup_else` | `let x = match m.get(k) { Some(x) => x, None => { .. return } }` | — |
-// | `for range` over a map listed in `unordered_iteration` | `for (k, v) in m` in key order | `unordered_iteration` |
+// | `for range` over a map listed in `unordered_iteration` | `for (k, v) in unordered(m)`, in key order | `unordered_iteration` |
 // | `sprintf`, `errorf` with `%s %v %d %t %%` | text joined with `+`; a named type through `displays` | `displays` |
 // | `foreign` | refused with the reader's reason | — |
 //
@@ -207,7 +207,7 @@ const TAKEN_TYPES: List<Text> = [
 ]
 
 // Function names the output cannot declare: Ignite's builtin functions and the helpers.
-const TAKEN_FNS: List<Text> = ["log", "module", "wrapping_add", "wrapping_sub"]
+const TAKEN_FNS: List<Text> = ["log", "module", "wrapping_add", "wrapping_sub", "unordered"]
 
 // `OrderID` → `order_id`, `PendingOrders` → `pending_orders`, `HTTPServer` → `http_server`.
 fn snake(name: Text) -> Text {
@@ -1733,7 +1733,7 @@ fn range_head(fx: Fx, key: Text, value: Text, over: Expr, pos: Text) -> Result<T
       if !has(fx.w.facts.unordered_iteration, pos) {
         return Err("a loop over a map that `unordered_iteration` does not list")
       }
-      Ok("for (" + k + ", " + v + ") in " + src + " " + r"{")
+      Ok("for (" + k + ", " + v + ") in unordered(" + val(fx, over)?.text + ") " + r"{")
     }
     Type.Slice(_) => if key == "_" {
       Ok("for " + v + " in " + src + " " + r"{")
@@ -1964,6 +1964,99 @@ fn foreign(body: List<Stmt>) -> Option<Refuse> {
 
 // ---- functions ---------------------------------------------------------------------------
 
+// The body of a function with results, ending in Go's terminating statement (a `return`, an
+// `if` with `else`, a `switch` with `default`, each branch terminating), so that the written
+// function ends in a value. A trailing `switch` without `default` that names every variant of
+// its enum tag cannot fall through: its last case becomes the `default`. Any other body that
+// can end without returning is refused at its last statement.
+fn closed(w: W, body: List<Stmt>, pos: Text) -> Result<List<Stmt>, Refuse> {
+  let n = body.len()
+  if n == 0 {
+    return Err(Refuse { pos, reason = OPEN_END })
+  }
+  var out = body.slice(0, n - 1)
+  let last = body[n - 1]
+  out.push(match last {
+    Stmt.Return(_) => last
+    Stmt.If(i) => {
+      if i.else_.is_empty() {
+        return Err(Refuse { pos = i.pos, reason = OPEN_END })
+      }
+      var x = i
+      x.then = closed(w, i.then, i.pos)?
+      x.else_ = closed(w, i.else_, i.pos)?
+      Stmt.If(x)
+    }
+    Stmt.Switch(sw) => {
+      var cases: List<Case> = []
+      for c in sw.cases {
+        cases.push(Case { values = c.values, body = closed(w, c.body, sw.pos)? })
+      }
+      var defaults = 0
+      for c in cases {
+        if c.values.is_empty() {
+          defaults = defaults + 1
+        }
+      }
+      if defaults == 0 {
+        match exhaustive(w, sw.tag, cases) {
+          Ok(_) => {}
+          Err(reason) => return Err(Refuse { pos = sw.pos, reason })
+        }
+        let k = cases.len() - 1
+        var opened = cases.slice(0, k)
+        opened.push(Case { values = [], body = cases[k].body })
+        cases = opened
+      }
+      var x = sw
+      x.cases = cases
+      Stmt.Switch(x)
+    }
+    other => return Err(Refuse { pos = stmt_pos(other), reason = OPEN_END })
+  })
+  Ok(out)
+}
+
+const OPEN_END: Text = "a function with results whose body can end without returning"
+
+// Whether the cases of a `switch` on `tag` name every variant of its enum, so it cannot fall
+// through.
+fn exhaustive(w: W, tag: Option<Expr>, cases: List<Case>) -> Result<Unit, Text> {
+  let open = "a switch without default ends a function with results"
+  let t = match tag {
+    Some(t) => t
+    None => return Err(open)
+  }
+  let name = match type_of(t) {
+    Type.Named(n) => n.name
+    _ => return Err(open)
+  }
+  let en = match decl(w, name) {
+    Some(TypeDecl.Enum(en)) => en
+    _ => return Err(open)
+  }
+  var named: List<Text> = []
+  for c in cases {
+    for v in c.values {
+      match v {
+        Expr.Const(k) => if k.t == type_of(t) {
+          named.push(k.name)
+        }
+        _ => {}
+      }
+    }
+  }
+  if cases.is_empty() {
+    return Err(open)
+  }
+  for v in en.variants {
+    if !has(named, v.name) {
+      return Err("a switch without default that names not every variant of " + name + " ends a function with results")
+    }
+  }
+  Ok(())
+}
+
 fn func(w: W, f: Func) -> Result<List<Text>, Refuse> {
   let pos = f.pos
   let key = func_key(f)
@@ -2092,7 +2185,8 @@ fn func(w: W, f: Func) -> Result<List<Text>, Refuse> {
       lines.push("  var " + value_ident(p.name) + " = " + value_ident(p.name))
     }
   }
-  lines.append(indent(block(fx, f.body)?))
+  let body = if base.is_empty() { f.body } else { closed(w, f.body, pos)? }
+  lines.append(indent(block(fx, body)?))
   let ends_in_return = match f.body.len() {
     0 => false
     n => match f.body[n - 1] {
@@ -2299,6 +2393,9 @@ fn write(m: CirModule) -> Result<Written, Text> {
   if sub {
     tail.push(WRAPPING_SUB)
   }
+  if contains(body, ") in unordered(") {
+    tail.push(UNORDERED)
+  }
   var header = ["package codespec." + m.name, "", "// Code generated by codespec-write-ignite from cir/1. DO NOT EDIT."]
   if !m.doc.is_empty() {
     header.push("//")
@@ -2405,6 +2502,14 @@ fn error_enum(w: W, types: List<TypeDecl>, funcs: List<Func>, msg: Bool) -> Resu
   lines.push(r"}")
   Ok(Some(lines))
 }
+
+// Ignite iterates a map in key order; the identity `unordered` marks a loop whose order cir/1
+// leaves unspecified, so that `codespec-read-ignite` reads it back as cir/1's range over a map
+// and refuses every other map loop.
+const UNORDERED: List<Text> = [
+  "// A map whose iteration order the source leaves unspecified; Ignite's runs in key order.",
+  "fn unordered<T>(m: T) -> T = m"
+]
 
 const WRAPPING_ADD: List<Text> = [
   "// Go's integer addition, which wraps on overflow where Ignite's fails.",
@@ -2551,7 +2656,40 @@ test "a map loop is written in key order only where unordered_iteration lists it
   let f = func_of("Walk", param("m", map), "", loop_)
   assert refusals_of(module_of("", f, r#""func:Walk""#, NO_FACTS)) == ["func:Walk m.go:5: a loop over a map that `unordered_iteration` does not list"]
   let listed = r#"{"shared":[],"unordered_iteration":["m.go:5"]}"#
-  assert contains(source_of(module_of("", f, r#""func:Walk""#, listed)), "fn walk(m: Map<Text, Int>) {{\n  for (k, _) in m {{\n  }}\n}}")
+  let source = source_of(module_of("", f, r#""func:Walk""#, listed))
+  assert contains(source, "fn walk(m: Map<Text, Int>) {{\n  for (k, _) in unordered(m) {{\n  }}\n}}")
+  assert contains(source, "\nfn unordered<T>(m: T) -> T = m\n")
+  assert !contains(source_of(module_of("", func_of("Nothing", "", "", ""), r#""func:Nothing""#, NO_FACTS)), "unordered")
+}
+
+test "a switch without default ends a function in a value when it names every variant, else is refused" {
+  let named = r#"{"k":"named","name":"Color"}"#
+  let color = r#"{"k":"enum","name":"Color","exported":true,"under":"# + STR + r#","variants":[{"name":"Red","value":{"k":"lit","value":"\"red\"","t":"# + STR + r#"}},{"name":"Blue","value":{"k":"lit","value":"\"blue\"","t":"# + STR + r#"}}],"pos":"m.go:2"}"#
+  let red = r#"{"k":"const","name":"Red","t":"# + named + r#"}"#
+  let blue = r#"{"k":"const","name":"Blue","t":"# + named + r#"}"#
+  let lit = |s: Text| r#"{"k":"lit","value":"\""# + s + r#"\"","t":"# + STR + r#"}"#
+  let case_ = |v: Text, s: Text, line: Text| r#"{"values":["# + v + r#"],"body":["# + ret(lit(s), "m.go:" + line) + r#"]}"#
+  let all = r#"{"k":"switch","tag":"# + var_of("c", named) + r#","cases":["# + case_(red, "r", "5") + "," + case_(blue, "b", "6") + r#"],"pos":"m.go:4"}"#
+  let some = r#"{"k":"switch","tag":"# + var_of("c", named) + r#","cases":["# + case_(red, "r", "5") + r#"],"pos":"m.go:4"}"#
+  let label = func_of("Label", param("c", named), STR, all)
+  let expected = [
+    "fn label(c: Color) -> Text {{",
+    "  if c == Color.Red {{",
+    "    return \"r\"",
+    "  }} else {{",
+    "    return \"b\"",
+    "  }}",
+    "}}"
+  ]
+  assert contains(source_of(module_of(color, label, r#""type:Color","func:Label""#, NO_FACTS)), expected.join("\n"))
+  let partial = func_of("Label", param("c", named), STR, some)
+  assert refusals_of(module_of(color, partial, r#""type:Color","func:Label""#, NO_FACTS)) == [
+    "func:Label m.go:4: a switch without default that names not every variant of Color ends a function with results"
+  ]
+  let tail_if = r#"{"k":"if","cond":{"k":"lit","value":"true","t":"# + BOOL_T + r#"},"then":["# + ret(lit("r"), "m.go:5") + r#"],"else":[],"pos":"m.go:4"}"#
+  assert refusals_of(module_of(color, func_of("Label", param("c", named), STR, tail_if), r#""type:Color","func:Label""#, NO_FACTS)) == [
+    "func:Label m.go:4: a function with results whose body can end without returning"
+  ]
 }
 
 test "a pointer to a shared type is refused, a channel too" {
