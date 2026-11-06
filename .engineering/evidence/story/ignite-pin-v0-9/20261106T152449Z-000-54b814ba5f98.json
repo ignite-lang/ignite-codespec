@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-06T15:24:49Z",
+  "actor": "human:timo",
+  "artifact": "story:ignite-pin-v0-9",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check, IGNITE=v0.9.0: harness 200 seeds x 300 commands, 4 implementations byte-equal; writer 22 passed, reader 20 passed; EXIT=0",
+    "reference": "https://github.com/ignite-lang/ignite-codespec/commit/80948e8"
+  }
+}
