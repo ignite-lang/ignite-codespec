@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:ledger-example
 kind: story
-status: draft
+status: active
 title: 'examples/ledger: a channel-free Go example with Go and Ignite harness drivers'
 relations:
 - decomposes: epic:ignite-codespec-bridge
@@ -14,7 +14,10 @@ scope:
   path: Taskfile.yml
 - confidence: cited
   path: examples/ledger
-revision: 6
+revision: 8
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"review_outcome":3}}}
+- {from: "proposed", to: "active", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"review_outcome":3}}}
 ---
 # Story: ledger-example
 
