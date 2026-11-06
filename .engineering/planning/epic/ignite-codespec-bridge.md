@@ -4,13 +4,13 @@ id: epic:ignite-codespec-bridge
 kind: epic
 status: draft
 title: Ignite and codespec, both directions
-revision: 3
+revision: 4
 ---
 # Epic: ignite-codespec-bridge
 
 ## Outcome
 
-Code moves between Ignite and every language codespec reads or writes, in both directions, through `cir/1`, with adapters written in Ignite and every translation accepted by codespec's comparison harness only.
+Ignite becomes a language of codespec: Ignite is read into `cir/1` and `cir/1` is written as Ignite, so codespec moves code between Ignite and every language it has adapters for, with adapters written in Ignite and every translation accepted by codespec's comparison harness only.
 
 ## Context
 

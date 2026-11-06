@@ -7,11 +7,11 @@ representation, with readers that lift a language into it, passes that rewrite i
 emit a language from it. Every translation is checked by running the original and the output on the
 same seeded inputs and comparing the outputs byte for byte.
 
-This repository connects Ignite to it, in both directions, and is written in Ignite:
+This repository makes Ignite one of codespec's languages, in both directions, and is written in Ignite. It knows `cir/1` and Ignite and no other language; moving code between Ignite and Go, Rust or any other language is codespec's, through that language's adapters:
 
 ```
-Go / Rust ──codespec reader──▶ cir/1 ──codespec-write-ignite──▶ Ignite      (1, codespec → Ignite)
-Ignite ──codespec-read-ignite──▶ cir/1 ──codespec writer──▶ Go / Rust       (2, Ignite → codespec)
+cir/1 ──codespec-write-ignite──▶ Ignite      (1, codespec → Ignite)
+Ignite ──codespec-read-ignite──▶ cir/1       (2, Ignite → codespec)
 ```
 
 ## 1. Adapters
@@ -85,7 +85,7 @@ and the refusals are the measurement.
 | C0 | repository, generated `cir.ignite`, strict reading and canonical writing | every checked-in codespec example document read and re-encoded gives the same bytes |
 | C1 | `codespec-write-ignite` | an example without channels and shared pointers: `ignite check` silent on the output, harness byte-equal against the Go original; `orders`: the refusal list, each with position and reason |
 | C2 | ignite `typed-program-json` (ignite repository) | `ignite emit --typed-json` on every std and example file, a type on every expression |
-| C3 | `codespec-read-ignite` | an Ignite example → `cir/1` → codespec's Go and Rust writers, harness byte-equal |
+| C3 | `codespec-read-ignite` | an Ignite example → `cir/1` that passes `codespec validate --canonical`, deterministic; behaviour judged by C4 |
 | C4 | round trip | Ignite → `cir/1` → Ignite, harness byte-equal |
 
 ## 7. Open questions
