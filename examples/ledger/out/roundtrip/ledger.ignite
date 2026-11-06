@@ -74,7 +74,7 @@ fn Ledger.place(l: Ledger, customer: Text, total: Int, gift: Bool) -> (Ledger, R
   if total <= 0 {
     return (l, Err(Error.ErrInvalidTotal))
   }
-  l.seq = wrapping_add(l.seq, 1)
+  l.seq = l.seq.wrapping_add(1)
   let id: Text = "o-" + l.seq.to_text()
   l.orders.put(id, Order { id = id, customer = customer, total = total, status = Status.Pending, gift = gift, tracking = "" })
   l.events.push(Event { kind = EventKind.OrderPlaced, id = id, customer = customer, total = total, tracking = "" })
@@ -173,17 +173,6 @@ fn Error.text(e: Error) -> Text = match e {
   Error.ErrInvalidTotal => "total must be positive"
   Error.ErrWrongState(x) => ErrWrongState.error(x)
   Error.Msg(text) => text
-}
-
-// Go's integer addition, which wraps on overflow where Ignite's fails.
-fn wrapping_add(a: Int, b: Int) -> Int {
-  if b > 0 && a > 9223372036854775807 - b {
-    return (a + (-9223372036854775808)) + (b + (-9223372036854775808))
-  }
-  if b < 0 && a < (-9223372036854775808) - b {
-    return (a - (-9223372036854775808)) + (b - (-9223372036854775808))
-  }
-  a + b
 }
 
 // A map whose iteration order the source leaves unspecified; Ignite's runs in key order.

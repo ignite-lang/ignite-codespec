@@ -74,8 +74,9 @@ and a reason; nothing is approximated. "Verified" rows cite the Ignite contract 
   results returns the receiver alone. Every method is an associated fn called `T.m(x, ..)`.
 - A newtype is an alias (`type OrderID = Text`); an enum gets `T.value(v)`, the value the source
   gives each variant; `error` is the module's `enum Error` with `Error.text(e)`.
-- `int` arithmetic: `+`, `-`, `++`, `--` go through `wrapping_add` and `wrapping_sub`, emitted
-  when used, because Go's integers wrap and Ignite's fail; `*`, `/`, `%` are refused.
+- `int` arithmetic: `+`, `-`, `++`, `--` are the builtins `a.wrapping_add(b)` and
+  `a.wrapping_sub(b)` (`0.wrapping_sub(x)` for `-x`), because Go's integers wrap and Ignite's
+  fail; `*`, `/`, `%` are refused.
 - A refusal names the layout key (`type:Service`, `func:Service.Audit`), the position of the
   construct and the reason. A refused type takes every declaration that mentions it, a refused
   function every caller. `cir/1` gives a struct field no position, so a field's refusal carries
@@ -111,7 +112,7 @@ capability resources; closures until `cir/1` has a node for them.
   is `{ignite, codespec-read-ignite, 0.0.0}`; every declaration is `exported`.
 - Inverse of the writer where it writes: `fn E.value` becomes the enum's values, the writer's
   `enum Error` with `fn Error.text` becomes sentinels (`Msg(t)` is `errorf("%s", t)`),
-  `wrapping_add`/`wrapping_sub` become `+`/`-`, `x = x + 1` is `incr`, `T.m(r: T, ..)` is a
+  `a.wrapping_add(b)`/`a.wrapping_sub(b)` become `+`/`-`, `x = x + 1` is `incr`, `T.m(r: T, ..)` is a
   method, `let x = match m.get(k) { Some(x) => x, None => { .. return } }` is `lookup_else`.
 - An enum without a `value` fn gets the values 0, 1, … (no Ignite program observes them). A
   union variant's payload fields are `f0`, `f1`, …. Text literals are written in Go's (JSON's)
