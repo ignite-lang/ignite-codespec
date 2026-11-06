@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:ignite-reader
 kind: story
-status: proposed
+status: active
 title: 'codespec-read-ignite: Ignite to cir/1'
 relations:
 - decomposes: epic:ignite-codespec-bridge
@@ -14,9 +14,10 @@ scope:
   path: Taskfile.yml
 - confidence: inferred
   path: src/read.ignite
-revision: 9
+revision: 10
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-06T01:42:46Z", actor: "human:timo", revision: 9, decided_on: {"recorded":{"review_outcome":6}}}
+- {from: "proposed", to: "active", at: "2026-11-06T04:00:44Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"review_outcome":6}}}
 ---
 # Story: ignite-reader
 
