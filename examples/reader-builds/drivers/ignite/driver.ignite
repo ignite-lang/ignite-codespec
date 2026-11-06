@@ -1,6 +1,6 @@
 package buildsdriver
 
-import buildsdriver.builds.{Color, Pair, size, name, bump, same}
+import buildsdriver.builds.{Color, size, name}
 
 // The harness driver of the Ignite original: reads and ignores the trace, prints one line per
 // case of `builds.ignite` (its sibling through the link `builds.ignite` beside this file).
@@ -16,9 +16,7 @@ fn Driver.main(self: Driver) -> Result<Unit, IoError> {
   xs.push(2)
   let out = [
     "size {size(xs)}",
-    "name {name(Color.Green)}",
-    "bump {bump(1)}",
-    "same {same(Pair { xs = xs }, Pair { xs = xs })}"
+    "name {name(Color.Green)}"
   ]
   Stdout.write_all(out.map(|l| l + "\n").join("").to_bytes())
 }

@@ -111,9 +111,32 @@ capability resources; closures until `cir/1` has a node for them.
 - Not expressible, so refused: generic types and functions, records with non-zero field
   defaults, union values and `match` that takes data apart, `Result` with another error type,
   `?`, closures, `while`/`loop`, list literals, `assert`, effects. Tests are not read.
-- Known gaps: the typed document resolves aliases, so a newtype's uses read as its underlying
-  type; Ignite's `Int` operators fail on overflow where cir/1's wrap; a map loop iterates in key
-  order in Ignite and in no order in cir/1 (`unordered_iteration` then marks it).
+- `Int` is `int {width: platform}`, the type cir/1 gives Go's `int` and `len`, so `len` needs
+  no conversion.
+- Values against shared storage: Ignite's lists, maps and records holding them are values, Go's
+  slices and maps share storage, and cir/1 has no copy. In a function that writes a list or map
+  in place (`push`, `put`), a read of a variable holding one where Ignite copies it (`let`,
+  assignment, record field, element, argument of a call that writes in place or returns one) is
+  refused, and a write in place must start from a local a `let` or `var` there made (not a
+  parameter, loop variable or lookup). Returning such a local moves it. Over-refusal is the
+  price: no copy is inserted, since cir/1 cannot express one.
+- `match` takes its first matching arm, `switch` its default last: a catch-all arm before
+  another arm is refused, as is a value two arms name. A `match` without a catch-all is
+  exhaustive, so as a function's value its last case is the default (Go needs the return).
+- Refused because Go cannot build the cir/1 they would give: a `let` of a name its block already
+  declares (`:=` with no new variable), `==` on a value holding a list, map or union, a block
+  in statement position. A name bound by a refused statement is refused where it is used, never
+  read as an outer variable of the same name.
+- A loop over a map is refused: Ignite's runs in key order, cir/1's in none (codespec's
+  `unordered_iteration` fact marks a position; cir/1 has no ordered form).
+- Exception, stated: Ignite's `Int` operators trap on overflow where cir/1's wrap. The two
+  differ only on a program that traps, which is written as one that does not (`AGENTS.md`).
+- Known gap: the typed document resolves aliases, so a newtype's uses read as its underlying
+  type.
+- `examples/reader-values/values.cir.json` and `examples/reader-builds/builds.cir.json` are the
+  documents of the adversary cases (`task reader-values`, `task reader-builds`): the first
+  refuses every case with its position and reason, the second's Go builds and matches Ignite in
+  the harness.
 - `examples/ledger/reference.cir.json` is the reader's document of the ledger reference, kept
   byte-equal by `task read-ledger`.
 

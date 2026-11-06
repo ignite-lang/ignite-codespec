@@ -27,7 +27,7 @@ import codespec.cir.{
 // | Ignite | cir/1 |
 // |---|---|
 // | `package a.m` | module `m` |
-// | `Int`, `Byte` | `int` 64 signed, `int` 8 unsigned |
+// | `Int`, `Byte` | `int` platform signed (Go's `int`, as `len` gives), `int` 8 unsigned |
 // | `Bool`, `Text`, `Unit` | `bool`, `string`, `unit` |
 // | `List<T>`, `Map<K, V>`, a tuple of results | `slice`, `map`, several results |
 // | record (fields with zero defaults only) | `struct` |
@@ -37,7 +37,7 @@ import codespec.cir.{
 // | `fn T.m(r: T, ..)` | method `T.m` with receiver `r`; an associated fn without one is the function `m` |
 // | `let`, `var` with a value | `let` |
 // | `x = e`; `x = x + 1`, `x = x - 1` | `assign`; `incr`, `decr` |
-// | `if`, `for x in`, `for (k, v) in`, `match` on constants, `return`, a call | `if`, `for_range`, `switch`, `return`, `expr` |
+// | `if`, `for x in` a list, `match` on constants (catch-all last), `return`, a call | `if`, `for_range`, `switch`, `return`, `expr` |
 // | the last expression of a body | `return` (through `if` and `match`, one per branch) |
 // | `let x = match m.get(k) { Some(x) => x, None => { .. return } }` | `lookup_else` |
 // | `xs.push(v)`, `m.put(k, v)`, `.len()`, `Map.empty()`, `[]` | `append`, map assignment, `len`, `make` |
@@ -45,11 +45,11 @@ import codespec.cir.{
 // | `Result<T, Error>` of the writer's `enum Error` | `(T, error)`: its variants without payload are sentinels, `Msg(t)` is `errorf` |
 // | `Option<T>` result | `(T, bool)` |
 // | `wrapping_add(a, b)`, `wrapping_sub(a, b)` (the writer's helpers) | `+`, `-` |
-// | `while`, `loop`, `?`, closures, `assert`, data in patterns, generics, `spawn`, systems | `foreign` statement or a refused declaration |
+// | `while`, `loop`, a loop over a map, `?`, closures, `assert`, data in patterns, generics, `spawn`, systems; a list or map Go would share where Ignite copies; a `let` its block already declares; `==` on lists, maps or unions | `foreign` statement or a refused declaration |
 //
 // Tests and test-only items are not part of the module and are not read. The integer
-// operators of Ignite fail on overflow where cir/1's (Go's) wrap: a program that overflows
-// reads as one that wraps.
+// operators of Ignite trap on overflow where cir/1's (Go's) wrap: a program that traps reads as one
+// that wraps, the one exception AGENTS.md states. Shared storage: see `SHARED` below.
 //
 // This file is a program file (package `codespec`) importing the sibling `codespec.cir`, as
 // `write.ignite` is; `pretty` is copied from `cir_json.ignite`, since a program file cannot
@@ -315,7 +315,7 @@ fn is_variant(m: Model, enum_name: Text, name: Text) -> Bool = match find_enum(m
   None => false
 }
 
-fn int_type() -> Type = Type.Int(IntType { width = IntWidth.V64, signed = true })
+fn int_type() -> Type = Type.Int(IntType { width = IntWidth.Platform, signed = true })
 
 fn named(name: Text) -> Type = Type.Named(NamedType { name })
 
@@ -714,6 +714,146 @@ type Cx {
   shape: Shape
   results: List<Type>
   values: List<Type>
+  // The function writes a list or map in place (`push`, `put`).
+  writes: Bool
+  // Locals bound by a `let` or `var` here: a write in place may only reach one of these.
+  fresh: List<Text>
+  // The names the current Go block declares (the parameters for the function's own).
+  scope: List<Text>
+}
+
+// Ignite's lists and maps are values; Go's slices and maps share their storage when copied.
+// cir/1 has no copy, so in a function that writes a list or map in place, a read of a
+// variable holding one in a position that copies it is refused, and a write in place may only
+// reach a list or map a `let` or `var` here made.
+const SHARED: Text = "a list or map read from a variable where Ignite copies it and Go shares it, in a function that writes a list or map in place: cir/1 has no copy"
+
+// Whether a value of `t` holds a slice or map, directly or through struct fields.
+fn holds_container(m: Model, t: Type, seen: List<Text>) -> Bool = match t {
+  Type.Slice(_) => true
+  Type.Map(_) => true
+  Type.Tuple(tt) => {
+    for e in tt.elems {
+      if holds_container(m, e, seen) {
+        return true
+      }
+    }
+    false
+  }
+  Type.Named(n) => {
+    if has(seen, n.name) {
+      return false
+    }
+    var next = seen
+    next.push(n.name)
+    match find_struct(m, n.name) {
+      Some(s) => {
+        for f in s.fields {
+          if holds_container(m, f.t, next) {
+            return true
+          }
+        }
+        false
+      }
+      None => has(m.unions, n.name)
+    }
+  }
+  _ => false
+}
+
+// Whether Go's `==` compares two values of `t` as Ignite's does.
+fn comparable(m: Model, t: Type) -> Bool = match t {
+  Type.Int(_) => true
+  Type.Bool => true
+  Type.String => true
+  Type.Error => true
+  Type.Named(n) => match find_struct(m, n.name) {
+    Some(s) => {
+      for f in s.fields {
+        if !comparable(m, f.t) {
+          return false
+        }
+      }
+      true
+    }
+    None => !has(m.unions, n.name)
+  }
+  _ => false
+}
+
+// The expression `i` in a position that copies its value.
+fn copied(cx: Cx, i: Int) -> Result<Expr, Text> {
+  let node = expr_node(cx.d, i)
+  if cx.writes && has(["name", "field", "index", "tupleField"], str(node, "kind")) && holds_container(cx.m, type_of_node(cx, node)?, []) {
+    return Err(SHARED)
+  }
+  val(cx, i)
+}
+
+// A returned value: a local a `let` or `var` here made is shared with no other name, so
+// returning it moves it; anything else is a copy.
+fn returned_one(cx: Cx, i: Int) -> Result<Expr, Text> {
+  let node = expr_node(cx.d, i)
+  if str(node, "kind") == "name" && has(cx.fresh, str(node, "name")) {
+    return val(cx, i)
+  }
+  copied(cx, i)
+}
+
+fn returned_all(cx: Cx, list: List<Int>) -> Result<List<Expr>, Text> {
+  var out: List<Expr> = []
+  for a in list {
+    out.push(returned_one(cx, a)?)
+  }
+  Ok(out)
+}
+
+fn copied_all(cx: Cx, list: List<Int>) -> Result<List<Expr>, Text> {
+  var out: List<Expr> = []
+  for a in list {
+    out.push(copied(cx, a)?)
+  }
+  Ok(out)
+}
+
+// The variable a place (`x`, `x.f.g`) starts from.
+fn root_name(cx: Cx, i: Int) -> Text {
+  let node = expr_node(cx.d, i)
+  match str(node, "kind") {
+    "name" => str(node, "name")
+    "field" => root_name(cx, num(node, "receiver"))
+    _ => ""
+  }
+}
+
+// A `let` of `names` in the current Go block: refused when one is declared there already.
+fn declare(cx: Cx, names: List<Text>) -> Result<Cx, Text> {
+  var next = cx
+  for n in names {
+    if n == "_" {
+      continue
+    }
+    if has(next.scope, n) {
+      return Err("a `let` of " + n + ", which its block already declares: Go's := declares no new variable")
+    }
+    next.scope.push(n)
+  }
+  Ok(next)
+}
+
+// A statement cir/1 cannot express binds `names`: a later use of one is refused, not read as
+// an outer variable of the same name.
+fn unbound(cx: Cx, names: List<Text>) -> Cx {
+  var next = cx
+  for n in names {
+    if n != "_" {
+      next.locals.push((n, Type.Any))
+      if !has(next.scope, n) {
+        next.scope.push(n)
+      }
+    }
+  }
+  next
 }
 
 fn local_type(cx: Cx, name: Text) -> Option<Type> {
@@ -783,7 +923,11 @@ fn val(cx: Cx, i: Int) -> Result<Expr, Text> {
       if !has(["+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&&", "||"], op) {
         return Err("the operator " + op)
       }
-      Ok(Expr.Binop(BinopExpr { op, x = val(cx, num(node, "left"))?, y = val(cx, num(node, "right"))?, t = type_of_node(cx, node)? }))
+      let x = val(cx, num(node, "left"))?
+      if (op == "==" || op == "!=") && !comparable(cx.m, type_of_node(cx, expr_node(cx.d, num(node, "left")))?) {
+        return Err(op + " on " + str(member(expr_node(cx.d, num(node, "left")), "type"), "text") + ": cir/1's == does not compare lists, maps or unions by value")
+      }
+      Ok(Expr.Binop(BinopExpr { op, x, y = val(cx, num(node, "right"))?, t = type_of_node(cx, node)? }))
     }
     "unary" => Ok(Expr.Unop(UnopExpr { op = str(node, "op"), x = val(cx, num(node, "operand"))?, t = type_of_node(cx, node)? }))
     "tuple" => Err("a tuple outside a return: cir/1 has no tuple value")
@@ -806,6 +950,7 @@ fn name_val(cx: Cx, node: Json) -> Result<Expr, Text> {
   let name = str(node, "name")
   let t = member(node, "type")
   match local_type(cx, name) {
+    Some(Type.Any) => return Err("the name " + name + ", bound by a statement cir/1 cannot express")
     Some(lt) => return Ok(Expr.Var(VarExpr { name, t = lt }))
     None => {}
   }
@@ -843,13 +988,16 @@ fn record_val(cx: Cx, node: Json, base: Option<Expr>) -> Result<Expr, Text> {
   let t = named(name)
   var given: List<(Text, Expr)> = []
   for f in items(node, "fields") {
-    given.push((str(f, "name"), val(cx, num(f, "value"))?))
+    given.push((str(f, "name"), copied(cx, num(f, "value"))?))
   }
   match base {
     None => Ok(Expr.Struct(StructExpr { name, fields = given.map(|g| FieldInit { name = g.0, value = g.1 }), t }))
     Some(b) => {
       var fields: List<FieldInit> = []
       for f in decl.fields {
+        if cx.writes && holds_container(cx.m, f.t, []) && !has(given.map(|g| g.0), f.name) {
+          return Err(SHARED)
+        }
         var value = Expr.Field(FieldExpr { x = b, name = f.name, t = f.t })
         for (n, v) in given {
           if n == f.name {
@@ -861,6 +1009,22 @@ fn record_val(cx: Cx, node: Json, base: Option<Expr>) -> Result<Expr, Text> {
       Ok(Expr.Struct(StructExpr { name, fields, t }))
     }
   }
+}
+
+// The arguments of a call of the module's fn `qualified`. One that writes no list or map in
+// place and returns nothing holding one cannot change or keep what it is given, so Go's
+// sharing is not seen and its arguments are read as they are; any other's are copies.
+fn call_args(cx: Cx, qualified: Text, list: List<Int>) -> Result<List<Expr>, Text> {
+  match fn_decl(cx.d, qualified) {
+    Some(decl) => if !writes_in_place(cx.d, decl) && match ty(cx.m, member(decl, "ret")) {
+      Ok(t) => !holds_container(cx.m, t, [])
+      Err(_) => false
+    } {
+      return args_of(cx, list)
+    }
+    None => {}
+  }
+  copied_all(cx, list)
 }
 
 fn args_of(cx: Cx, list: List<Int>) -> Result<List<Expr>, Text> {
@@ -899,7 +1063,7 @@ fn call_val(cx: Cx, node: Json) -> Result<Expr, Text> {
       if str(callee, "module") != cx.m.module {
         return Err("a call of " + str(callee, "module") + "." + str(callee, "name") + ", outside the module")
       }
-      fn_call(cx, str(callee, "name"), args_of(cx, indexes(node, "args"))?, type_of_node(cx, node)?)
+      fn_call(cx, str(callee, "name"), call_args(cx, str(callee, "name"), indexes(node, "args"))?, type_of_node(cx, node)?)
     }
     "variant" => Err("the variant constructor " + str(expr_node(cx.d, num(node, "function")), "name") + ": cir/1 has no expression for a union value")
     "builtin" => Err("the builtin `" + str(expr_node(cx.d, num(node, "function")), "name") + "` (" + str(callee, "name") + ")")
@@ -926,9 +1090,9 @@ fn method_val(cx: Cx, node: Json) -> Result<Expr, Text> {
       let owner_named = str(receiver, "kind") == "name" && contains(qualified, ".") && str(receiver, "name") + "." + str(node, "name") == qualified
       var all: List<Expr> = []
       if !owner_named {
-        all.push(val(cx, num(node, "receiver"))?)
+        all.push(call_args(cx, qualified, [num(node, "receiver")])?[0])
       }
-      all.append(args_of(cx, args)?)
+      all.append(call_args(cx, qualified, args)?)
       fn_call(cx, qualified, all, t)
     }
     "builtin" => builtin_val(cx, node, callee_name(node))
@@ -957,9 +1121,30 @@ fn builtin_val(cx: Cx, node: Json, builtin: Text) -> Result<Expr, Text> {
 
 fn foreign(d: Doc, node: Json, reason: Text) -> Stmt = Stmt.Foreign(ForeignStmt { lang = "ignite", src = src(d, node), reason, pos = pos(d, node) })
 
-// The statements of `block` (a `{stmts, span}`); with `tail`, the value of its last expression
-// statement is returned.
-fn block(cx: Cx, block: Json, tail: Bool) -> List<Stmt> = stmts(cx, indexes(block, "stmts"), tail)
+
+// The statements of `block` (a `{stmts, span}`), a Go block of its own; with `tail`, the value
+// of its last expression statement is returned.
+fn block(cx: Cx, block: Json, tail: Bool) -> List<Stmt> {
+  var inner = cx
+  inner.scope = []
+  stmts(inner, indexes(block, "stmts"), tail)
+}
+
+// The names a statement binds for the statements after it.
+fn bound_names(d: Doc, node: Json) -> List<Text> = match str(node, "kind") {
+  "let" => [str(node, "name")]
+  "letPattern" => {
+    var out: List<Text> = []
+    for item in indexes(pattern_node(d, num(node, "pattern")), "items") {
+      let q = pattern_node(d, item)
+      if str(q, "kind") == "binding" {
+        out.push(str(q, "name"))
+      }
+    }
+    out
+  }
+  _ => []
+}
 
 fn stmts(cx: Cx, list: List<Int>, tail: Bool) -> List<Stmt> {
   var c = cx
@@ -973,7 +1158,10 @@ fn stmts(cx: Cx, list: List<Int>, tail: Bool) -> List<Stmt> {
         out.append(more)
         c = next
       }
-      Err(reason) => out.push(foreign(c.d, node, reason))
+      Err(reason) => {
+        out.push(foreign(c.d, node, reason))
+        c = unbound(c, bound_names(c.d, node))
+      }
     }
     i = i + 1
   }
@@ -988,13 +1176,21 @@ fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
     "let" => {
       let name = str(node, "name")
       let t = ty(cx.m, member(node, "bindingType"))?
+      let declared = declare(cx, [name])?
+      var next = with_local(declared, name, t)
+      next.fresh.push(name)
       let value = expr_node(d, num(node, "value"))
       match lookup_else(cx, name, value, at)? {
-        Some(s) => return Ok(([s], with_local(cx, name, t)))
+        Some(s) => {
+          if cx.writes && holds_container(cx.m, t, []) {
+            return Err(SHARED)
+          }
+          return Ok(([s], next))
+        }
         None => {}
       }
-      let rhs = val(cx, num(node, "value"))?
-      Ok(([Stmt.Let(LetStmt { names = [name], rhs = [rhs], pos = at })], with_local(cx, name, t)))
+      let rhs = copied(cx, num(node, "value"))?
+      Ok(([Stmt.Let(LetStmt { names = [name], rhs = [rhs], pos = at })], next))
     }
     "letPattern" => {
       let p = pattern_node(d, num(node, "pattern"))
@@ -1009,11 +1205,13 @@ fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
           "binding" => {
             names.push(str(q, "name"))
             next = with_local(next, str(q, "name"), ty(cx.m, member(q, "bindingType"))?)
+            next.fresh.push(str(q, "name"))
           }
           "wildcard" => names.push("_")
           _ => return Err("a binding to a pattern other than a tuple of names")
         }
       }
+      next = declare(next, names)?
       let value = expr_node(d, num(node, "value"))
       if str(value, "kind") != "call" && str(value, "kind") != "method" {
         return Err("a tuple bound from something other than a call: cir/1 has no tuple value")
@@ -1026,34 +1224,19 @@ fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
       let over = val(cx, num(node, "iter"))?
       let elem = match over_type(cx, num(node, "iter")) {
         Type.Slice(s) => s.elem
-        _ => return Err("a loop over something other than a list, or over a map without a pattern")
+        Type.Map(_) => return Err(MAP_LOOP)
+        _ => return Err("a loop over something other than a list")
+      }
+      if cx.writes && holds_container(cx.m, elem, []) {
+        return Err(SHARED)
       }
       let name = str(node, "name")
       let body = block(with_local(cx, name, elem), member(node, "body"), false)
       Ok(([Stmt.ForRange(ForRangeStmt { key = "_", val = name, over, body, pos = at })], cx))
     }
-    "forPattern" => {
-      let over = val(cx, num(node, "iter"))?
-      let (kt, vt) = match over_type(cx, num(node, "iter")) {
-        Type.Map(mt) => (mt.key, mt.elem)
-        _ => return Err("a loop with a pattern over something other than a map")
-      }
-      let p = pattern_node(d, num(node, "pattern"))
-      let parts = indexes(p, "items")
-      if str(p, "kind") != "tuple" || parts.len() != 2 {
-        return Err("a loop over a map whose pattern is not `(key, value)`")
-      }
-      let key = pattern_name(d, parts[0])?
-      let value = pattern_name(d, parts[1])?
-      var inner = cx
-      if key != "_" {
-        inner = with_local(inner, key, kt)
-      }
-      if value != "_" {
-        inner = with_local(inner, value, vt)
-      }
-      let body = block(inner, member(node, "body"), false)
-      Ok(([Stmt.ForRange(ForRangeStmt { key, val = value, over, body, pos = at })], cx))
+    "forPattern" => match over_type(cx, num(node, "iter")) {
+      Type.Map(_) => Err(MAP_LOOP)
+      _ => Err("a loop with a pattern over something other than a map")
     }
     "expr" => {
       let e = num(node, "expr")
@@ -1069,18 +1252,13 @@ fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
   }
 }
 
+// cir/1's range over a map has no order (codespec's `unordered_iteration` fact marks it); an
+// Ignite map iterates in key order.
+const MAP_LOOP: Text = "a loop over a map: Ignite's runs in key order, cir/1's in no order"
+
 fn over_type(cx: Cx, e: Int) -> Type = match type_of_node(cx, expr_node(cx.d, e)) {
   Ok(t) => t
   Err(_) => Type.Unit
-}
-
-fn pattern_name(d: Doc, p: Int) -> Result<Text, Text> {
-  let node = pattern_node(d, p)
-  match str(node, "kind") {
-    "binding" => Ok(str(node, "name"))
-    "wildcard" => Ok("_")
-    _ => Err("a loop pattern other than names")
-  }
 }
 
 // `let name = match m.get(k) { Some(x) => x, None => { .. return } }` as `lookup_else`.
@@ -1136,13 +1314,25 @@ fn lookup_else(cx: Cx, name: Text, value: Json, at: Text) -> Result<Option<Stmt>
   Ok(Some(Stmt.LookupElse(LookupElseStmt { name, map, index, then, pos = at })))
 }
 
-// The statements of the branch expression `e`: a block's statements, or one statement.
+// The statements of the branch expression `e`, a Go block of its own.
 fn branch(cx: Cx, e: Int, tail: Bool, at: Text) -> Result<List<Stmt>, Text> {
   let node = expr_node(cx.d, e)
   if str(node, "kind") == "block" {
     return Ok(block(cx, member(node, "block"), tail))
   }
-  if tail { tail_expr(cx, e, at) } else { expr_stmt(cx, e, at) }
+  var inner = cx
+  inner.scope = []
+  if tail { tail_expr(inner, e, at) } else { expr_stmt(inner, e, at) }
+}
+
+// A write in place (`push`, `put`) to the list or map at the place `receiver`: it must start
+// from a local a `let` or `var` here made, which no other name shares.
+fn written_place(cx: Cx, receiver: Int) -> Result<Expr, Text> {
+  let root = root_name(cx, receiver)
+  if !has(cx.fresh, root) {
+    return Err("a write in place to a list or map reached from " + (if root == "" { "an expression" } else { root }) + ", which Go shares with the caller or another name: cir/1 has no copy")
+  }
+  val(cx, receiver)
 }
 
 // An expression in statement position.
@@ -1152,25 +1342,25 @@ fn expr_stmt(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
   match str(node, "kind") {
     "if" => Ok([if_stmt(cx, node, false, at)?])
     "match" => Ok([switch_stmt(cx, node, false, at)?])
-    "block" => Ok(block(cx, member(node, "block"), false))
+    "block" => Err("a block in statement position: cir/1 has no block statement")
     "return" => return_stmts(cx, num(node, "value"), at)
     "method" => match callee_name(node) {
       "ListPush" => {
-        let place = val(cx, num(node, "receiver"))?
+        let place = written_place(cx, num(node, "receiver"))?
         var all = [place]
-        all.append(args_of(cx, indexes(node, "args"))?)
+        all.append(copied_all(cx, indexes(node, "args"))?)
         let t = type_of_node(cx, expr_node(d, num(node, "receiver")))?
         Ok([Stmt.Assign(AssignStmt { op = "", lhs = [place], rhs = [Expr.Intrinsic(IntrinsicExpr { name = "append", args = all, t })], pos = at })])
       }
       "MapPut" => {
-        let map = val(cx, num(node, "receiver"))?
+        let map = written_place(cx, num(node, "receiver"))?
         let args = indexes(node, "args")
         let elem = match type_of_node(cx, expr_node(d, num(node, "receiver")))? {
           Type.Map(mt) => mt.elem
           _ => return Err("`put` on something other than a map")
         }
-        let entry = Expr.Index(IndexExpr { x = map, index = val(cx, args[0])?, t = elem })
-        Ok([Stmt.Assign(AssignStmt { op = "", lhs = [entry], rhs = [val(cx, args[1])?], pos = at })])
+        let entry = Expr.Index(IndexExpr { x = map, index = copied(cx, args[0])?, t = elem })
+        Ok([Stmt.Assign(AssignStmt { op = "", lhs = [entry], rhs = [copied(cx, args[1])?], pos = at })])
       }
       _ => Ok([Stmt.Expr(ExprStmt { x = val(cx, e)?, pos = at })])
     }
@@ -1186,7 +1376,7 @@ fn tail_expr(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
   match str(node, "kind") {
     "if" => Ok([if_stmt(cx, node, true, at)?])
     "match" => Ok([switch_stmt(cx, node, true, at)?])
-    "block" => Ok(block(cx, member(node, "block"), true))
+    "block" => Err("a block as a value: cir/1 has no block statement")
     "return" => return_stmts(cx, num(node, "value"), at)
     _ => if cx.results.is_empty() && cx.shape == Shape.Plain {
       expr_stmt(cx, e, at)
@@ -1215,36 +1405,72 @@ fn if_stmt(cx: Cx, node: Json, tail: Bool, at: Text) -> Result<Stmt, Text> {
 }
 
 // `match` on a variable's constants as `switch`: arms of enum variants without payload,
-// literals, `|` of those, `_`, or a name binding the whole value.
+// literals, `|` of those, and last a `_` or a name binding the whole value. A `match` takes
+// its first matching arm and a `switch` its default last, so a catch-all arm before another is
+// refused, as is a value two arms name. A `match` without a catch-all is exhaustive (E046),
+// so as a function's last expression its last case is the default: Go needs a return there.
 fn switch_stmt(cx: Cx, node: Json, tail: Bool, at: Text) -> Result<Stmt, Text> {
   let d = cx.d
   let scrutinee = expr_node(d, num(node, "scrutinee"))
   let tag = val(cx, num(node, "scrutinee"))?
   let tag_type = type_of_node(cx, scrutinee)?
+  let arms = items(node, "arms")
   var cases: List<Case> = []
-  for arm in items(node, "arms") {
+  var seen: List<Text> = []
+  var defaulted = false
+  var i = 0
+  while i < arms.len() {
+    let arm = arms[i]
     let arm_at = d.file + ":" + num(member(arm, "span"), "line").to_text()
     let p = pattern_node(d, num(arm, "pattern"))
+    let kind = str(p, "kind")
     var inner = cx
-    var pre: List<Stmt> = []
-    let values = match str(p, "kind") {
-      "wildcard" => []
-      "binding" => {
-        if str(scrutinee, "kind") != "name" {
-          return Err("a `match` arm that binds a value other than a variable")
-        }
-        inner = with_local(cx, str(p, "name"), tag_type)
-        pre.push(Stmt.Let(LetStmt { names = [str(p, "name")], rhs = [tag], pos = arm_at }))
-        []
-      }
-      _ => case_values(cx, p, tag_type)?
+    inner.scope = []
+    var body: List<Stmt> = []
+    let catch_all = kind == "wildcard" || kind == "binding"
+    if catch_all && i < arms.len() - 1 {
+      return Err("a catch-all `match` arm before another arm: `match` takes the first arm that matches, cir/1's `switch` its default last")
     }
-    var body = pre
-    body.append(branch(inner, num(arm, "body"), tail, arm_at)?)
-    cases.push(Case { values, body })
+    let values = if kind == "wildcard" {
+      []
+    } else if kind == "binding" {
+      if str(scrutinee, "kind") != "name" {
+        return Err("a `match` arm that binds a value other than a variable")
+      }
+      if cx.writes && holds_container(cx.m, tag_type, []) {
+        return Err(SHARED)
+      }
+      inner = with_local(inner, str(p, "name"), tag_type)
+      inner.scope.push(str(p, "name"))
+      body.push(Stmt.Let(LetStmt { names = [str(p, "name")], rhs = [tag], pos = arm_at }))
+      []
+    } else {
+      case_values(cx, p, tag_type)?
+    }
+    for v in values {
+      let key = encode(Expr.to_json(v))
+      if has(seen, key) {
+        return Err("a `match` arm naming a value an earlier arm names: a `switch` names each value once")
+      }
+      seen.push(key)
+    }
+    let e = num(arm, "body")
+    let target = expr_node(d, e)
+    if str(target, "kind") == "block" {
+      body.append(stmts(inner, indexes(member(target, "block"), "stmts"), tail))
+    } else if tail {
+      body.append(tail_expr(inner, e, arm_at)?)
+    } else {
+      body.append(expr_stmt(inner, e, arm_at)?)
+    }
+    defaulted = defaulted || catch_all
+    let last = i == arms.len() - 1
+    cases.push(Case { values = if tail && last && !defaulted { [] } else { values }, body })
+    i = i + 1
   }
   Ok(Stmt.Switch(SwitchStmt { tag = Some(tag), cases, pos = at }))
 }
+
 
 fn case_values(cx: Cx, p: Json, t: Type) -> Result<List<Expr>, Text> {
   let d = cx.d
@@ -1291,7 +1517,7 @@ fn return_stmts(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
     if str(node, "kind") == "method" && callee_name(node) == "MapGet" {
       let t = cx.values[0]
       var name = "v"
-      while local_type(cx, name) != None {
+      while local_type(cx, name) != None || has(cx.scope, name) {
         name = name + "_"
       }
       let map = val(cx, num(node, "receiver"))?
@@ -1323,9 +1549,9 @@ fn returned(cx: Cx, e: Int) -> Result<List<Expr>, Text> {
       if str(node, "kind") != "tuple" {
         return Err("several results returned other than as a tuple literal")
       }
-      args_of(cx, indexes(node, "items"))
+      returned_all(cx, indexes(node, "items"))
     } else {
-      Ok([val(cx, e)?])
+      Ok([returned_one(cx, e)?])
     }
     Shape.Fallible => {
       let variant = result_variant(node, "Result")?
@@ -1363,9 +1589,9 @@ fn result_variant(node: Json, owner: Text) -> Result<Int, Text> {
 fn values_of(cx: Cx, e: Int) -> Result<List<Expr>, Text> {
   let node = expr_node(cx.d, e)
   if str(node, "kind") == "tuple" {
-    return args_of(cx, indexes(node, "items"))
+    return returned_all(cx, indexes(node, "items"))
   }
-  Ok([val(cx, e)?])
+  Ok([returned_one(cx, e)?])
 }
 
 // The error of `Err(e)`: a sentinel of the writer's `enum Error`, or `Msg(text)` as `errorf`.
@@ -1420,7 +1646,7 @@ fn assign(cx: Cx, node: Json, at: Text) -> Result<Stmt, Text> {
     }
     place = Expr.Field(FieldExpr { x = place, name = fname, t = current })
   }
-  let value = val(cx, num(node, "value"))?
+  let value = copied(cx, num(node, "value"))?
   match value {
     Expr.Binop(b) => if b.x == place && b.y == Expr.Lit(LitExpr { value = "1", t = int_type() }) {
       if b.op == "+" {
@@ -1697,6 +1923,21 @@ fn signature(m: Model, decl: Json) -> Result<(Option<Param>, List<Param>, List<T
   Ok((None, params, results, shape, values))
 }
 
+// Whether the body of the fn `decl` writes a list or map in place: a `push` or `put` within
+// its span.
+fn writes_in_place(d: Doc, decl: Json) -> Bool {
+  let span = member(decl, "span")
+  let start = num(span, "start")
+  let end = num(span, "end")
+  for e in d.exprs {
+    let at = num(member(e, "span"), "start")
+    if at >= start && at < end && str(e, "kind") == "method" && (callee_name(e) == "ListPush" || callee_name(e) == "MapPut") {
+      return true
+    }
+  }
+  false
+}
+
 fn func(d: Doc, m: Model, decl: Json) -> Result<Func, Text> {
   let (recv, params, results, shape, values) = signature(m, decl)?
   var locals: List<(Text, Type)> = []
@@ -1707,8 +1948,9 @@ fn func(d: Doc, m: Model, decl: Json) -> Result<Func, Text> {
   for p in params {
     locals.push((p.name, p.t))
   }
-  let cx = Cx { d, m, locals, shape, results, values }
-  let body = block(cx, member(decl, "body"), true)
+  let scope = locals.map(|l| l.0)
+  let cx = Cx { d, m, locals, shape, results, values, writes = writes_in_place(d, decl), fresh = [], scope }
+  let body = stmts(cx, indexes(member(decl, "body"), "stmts"), true)
   Ok(Func { name = str(decl, "name"), exported = true, recv, params, results, body, doc = "", pos = pos(d, decl) })
 }
 
@@ -1718,7 +1960,7 @@ fn func(d: Doc, m: Model, decl: Json) -> Result<Func, Text> {
 // --typed-json` printed (ignite f64d0f12b, `ignite.pin`) for a small source file, kept below
 // beside that source: `<NAME>_SRC` is the file, `<NAME>_DOC` its document.
 
-const INT: Text = r#"{"k":"int","width":"64","signed":true}"#
+const INT: Text = r#"{"k":"int","width":"platform","signed":true}"#
 const STR: Text = r#"{"k":"string"}"#
 const BOOL_T: Text = r#"{"k":"bool"}"#
 const ERR_T: Text = r#"{"k":"error"}"#
@@ -1817,7 +2059,7 @@ test "let, var, assignment, increment and decrement" {
   assert body[4] == assign_of(n, binop_of("*", n, lit_of("2", INT), INT), "stmts.ignite:14")
 }
 
-test "if and else if, range loops over a list and a map, a call, the last expression returned" {
+test "if and else if, a range loop over a list, a call, the last expression returned; a loop over a map is foreign" {
   let m = read_of(STMTS_DOC, STMTS_SRC)
   let body = body_json(m, "steps")
   let n = var_of("n", INT)
@@ -1825,20 +2067,19 @@ test "if and else if, range loops over a list and a map, a call, the last expres
   assert body[5] == r#"{"k":"if","cond":"# + binop_of(">", n, lit_of("3", INT), BOOL_T) + r#","then":["# + assign_of(n, lit_of("0", INT), "stmts.ignite:16") + r#"],"else":["# + inner + r#"],"pos":"stmts.ignite:15"}"#
   let items = var_of("items", r#"{"k":"slice","elem":"# + INT + r#"}"#)
   assert body[6] == r#"{"k":"for_range","key":"_","val":"item","over":"# + items + r#","body":["# + assign_of(n, binop_of("+", n, var_of("item", INT), INT), "stmts.ignite:23") + r#"],"pos":"stmts.ignite:22"}"#
-  let table = var_of("table", r#"{"k":"map","key":"# + STR + r#","elem":"# + INT + r#"}"#)
-  assert body[7] == r#"{"k":"for_range","key":"key","val":"value","over":"# + table + r#","body":["# + assign_of(n, binop_of("-", n, var_of("value", INT), INT), "stmts.ignite:26") + r#"],"pos":"stmts.ignite:25"}"#
+  assert body[7] == r#"{"k":"foreign","lang":"ignite","src":"for (key, value) in table {\n    n = n - value\n  }","reason":"# + quote(MAP_LOOP) + r#","pos":"stmts.ignite:25"}"#
   assert body[8] == r#"{"k":"expr","x":{"k":"call","name":"bump","args":["# + n + r#"],"t":{"k":"unit"}},"pos":"stmts.ignite:28"}"#
   assert body[9] == ret_of(n, "stmts.ignite:29")
   assert body.len() == 10
 }
 
-test "match on an enum is a switch, `|` several values, `_` the default case" {
+test "match on an enum is a switch, `|` several values, `_` or, at the end of a function, the last case the default" {
   let m = read_of(STMTS_DOC, STMTS_SRC)
   let c = var_of("c", named_of("Color"))
   let constant = |name: Text| r#"{"k":"const","name":""# + name + r#"","t":"# + named_of("Color") + r#"}"#
-  assert body_json(m, "name") == [r#"{"k":"switch","tag":"# + c + r#","cases":[{"values":["# + constant("Red") + r#"],"body":["# + ret_of(lit_of("\"red\"", STR), "stmts.ignite:35") + r#"]},{"values":["# + constant("Green") + "," + constant("Blue") + r#"],"body":["# + ret_of(lit_of("\"other\"", STR), "stmts.ignite:36") + r#"]}],"pos":"stmts.ignite:34"}"#]
+  assert body_json(m, "name") == [r#"{"k":"switch","tag":"# + c + r#","cases":[{"values":["# + constant("Green") + "," + constant("Blue") + r#"],"body":["# + ret_of(lit_of("\"other\"", STR), "stmts.ignite:35") + r#"]},{"values":[],"body":["# + ret_of(lit_of("\"red\"", STR), "stmts.ignite:36") + r#"]}],"pos":"stmts.ignite:34"}"#]
   assert body_json(m, "pick") == [r#"{"k":"switch","tag":"# + c + r#","cases":[{"values":["# + constant("Red") + r#"],"body":["# + ret_of(lit_of("1", INT), "stmts.ignite:40") + r#"]},{"values":[],"body":["# + ret_of(lit_of("2", INT), "stmts.ignite:41") + r#"]}],"pos":"stmts.ignite:39"}"#]
-  assert m.refusals.is_empty()
+  assert m.refusals.map(|r| r.pos + " " + r.reason) == ["stmts.ignite:25 " + MAP_LOOP]
 }
 
 test "records, updates, fields, indexes, lists, maps, text and operators" {
@@ -1991,8 +2232,8 @@ fn steps(start: Int, items: List<Int>, table: Map<Text, Int>) -> Int {
 fn bump(n: Int) {}
 
 fn name(c: Color) -> Text = match c {
-  Red => "red"
   Green | Blue => "other"
+  Red => "red"
 }
 
 fn pick(c: Color) -> Int = match c {
@@ -2001,7 +2242,7 @@ fn pick(c: Color) -> Int = match c {
 }
 "##
 
-test const STMTS_DOC: Text = r##"{"decls":[{"kind":"enum","name":"Color","span":{"column":1,"end":55,"endColumn":2,"endLine":7,"file":0,"line":3,"start":20},"testOnly":false,"typeParams":[],"variants":[{"name":"Red","payload":[],"span":{"column":3,"end":38,"endColumn":6,"endLine":4,"file":0,"line":4,"start":35}},{"name":"Green","payload":[],"span":{"column":3,"end":46,"endColumn":8,"endLine":5,"file":0,"line":5,"start":41}},{"name":"Blue","payload":[],"span":{"column":3,"end":53,"endColumn":7,"endLine":6,"file":0,"line":6,"start":49}}]},{"body":{"span":{"column":70,"end":383,"endColumn":2,"endLine":30,"file":0,"line":9,"start":126},"stmts":[0,1,2,3,4,5,9,11,13,14]},"bounds":[],"effectful":false,"kind":"fn","name":"steps","owner":null,"params":[{"name":"start","span":{"column":10,"end":76,"endColumn":20,"endLine":9,"file":0,"line":9,"start":66},"type":{"kind":"Int","text":"Int"}},{"name":"items","span":{"column":22,"end":94,"endColumn":38,"endLine":9,"file":0,"line":9,"start":78},"type":{"args":[{"kind":"Int","text":"Int"}],"kind":"List","text":"List<Int>"}},{"name":"table","span":{"column":40,"end":117,"endColumn":61,"endLine":9,"file":0,"line":9,"start":96},"type":{"args":[{"kind":"Text","text":"Text"},{"kind":"Int","text":"Int"}],"kind":"Map","text":"Map<Text, Int>"}}],"qualifiedName":"steps","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":383,"endColumn":2,"endLine":30,"file":0,"line":9,"start":57},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":17,"end":403,"endColumn":19,"endLine":32,"file":0,"line":32,"start":401},"stmts":[]},"bounds":[],"effectful":false,"kind":"fn","name":"bump","owner":null,"params":[{"name":"n","span":{"column":9,"end":399,"endColumn":15,"endLine":32,"file":0,"line":32,"start":393},"type":{"kind":"Int","text":"Int"}}],"qualifiedName":"bump","requires":null,"ret":{"kind":"Unit","text":"Unit"},"satisfies":[],"span":{"column":1,"end":403,"endColumn":19,"endLine":32,"file":0,"line":32,"start":385},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":29,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":433},"stmts":[15]},"bounds":[],"effectful":false,"kind":"fn","name":"name","owner":null,"params":[{"name":"c","span":{"column":9,"end":421,"endColumn":17,"endLine":34,"file":0,"line":34,"start":413},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}}],"qualifiedName":"name","requires":null,"ret":{"kind":"Text","text":"Text"},"satisfies":[],"span":{"column":1,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":405},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":28,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":514},"stmts":[16]},"bounds":[],"effectful":false,"kind":"fn","name":"pick","owner":null,"params":[{"name":"c","span":{"column":9,"end":503,"endColumn":17,"endLine":39,"file":0,"line":39,"start":495},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}}],"qualifiedName":"pick","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":487},"testOnly":false,"typeParams":[]}],"exprs":[{"kind":"name","name":"start","span":{"column":11,"end":143,"endColumn":16,"endLine":10,"file":0,"line":10,"start":138},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"a","span":{"column":11,"end":155,"endColumn":12,"endLine":11,"file":0,"line":11,"start":154},"type":{"kind":"Int","text":"Int"}},{"kind":"binary","left":3,"op":"+","right":4,"span":{"column":7,"end":167,"endColumn":12,"endLine":12,"file":0,"line":12,"start":162},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":7,"end":163,"endColumn":8,"endLine":12,"file":0,"line":12,"start":162},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":11,"end":167,"endColumn":12,"endLine":12,"file":0,"line":12,"start":166},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"binary","left":6,"op":"-","right":7,"span":{"column":7,"end":179,"endColumn":12,"endLine":13,"file":0,"line":13,"start":174},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":7,"end":175,"endColumn":8,"endLine":13,"file":0,"line":13,"start":174},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":11,"end":179,"endColumn":12,"endLine":13,"file":0,"line":13,"start":178},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"binary","left":9,"op":"*","right":10,"span":{"column":7,"end":191,"endColumn":12,"endLine":14,"file":0,"line":14,"start":186},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":7,"end":187,"endColumn":8,"endLine":14,"file":0,"line":14,"start":186},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":11,"end":191,"endColumn":12,"endLine":14,"file":0,"line":14,"start":190},"type":{"kind":"Int","text":"Int"},"value":2},{"cond":12,"else":16,"kind":"if","span":{"column":3,"end":272,"endColumn":4,"endLine":21,"file":0,"line":15,"start":194},"then":{"span":{"column":12,"end":218,"endColumn":4,"endLine":17,"file":0,"line":15,"start":203},"stmts":[6]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":13,"op":">","right":14,"span":{"column":6,"end":202,"endColumn":11,"endLine":15,"file":0,"line":15,"start":197},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"n","span":{"column":6,"end":198,"endColumn":7,"endLine":15,"file":0,"line":15,"start":197},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":10,"end":202,"endColumn":11,"endLine":15,"file":0,"line":15,"start":201},"type":{"kind":"Int","text":"Int"},"value":3},{"kind":"int","span":{"column":9,"end":214,"endColumn":10,"endLine":16,"file":0,"line":16,"start":213},"type":{"kind":"Int","text":"Int"},"value":0},{"cond":17,"else":21,"kind":"if","span":{"column":10,"end":272,"endColumn":4,"endLine":21,"file":0,"line":17,"start":224},"then":{"span":{"column":19,"end":251,"endColumn":4,"endLine":19,"file":0,"line":17,"start":233},"stmts":[7]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":18,"op":"<","right":19,"span":{"column":13,"end":232,"endColumn":18,"endLine":17,"file":0,"line":17,"start":227},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"n","span":{"column":13,"end":228,"endColumn":14,"endLine":17,"file":0,"line":17,"start":227},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":17,"end":232,"endColumn":18,"endLine":17,"file":0,"line":17,"start":231},"type":{"kind":"Int","text":"Int"},"value":0},{"kind":"int","span":{"column":12,"end":247,"endColumn":13,"endLine":18,"file":0,"line":18,"start":246},"type":{"kind":"Int","text":"Int"},"value":1},{"block":{"span":{"column":10,"end":272,"endColumn":4,"endLine":21,"file":0,"line":19,"start":257},"stmts":[8]},"kind":"block","span":{"column":10,"end":272,"endColumn":4,"endLine":21,"file":0,"line":19,"start":257},"type":{"kind":"Unit","text":"Unit"}},{"kind":"int","span":{"column":9,"end":268,"endColumn":10,"endLine":20,"file":0,"line":20,"start":267},"type":{"kind":"Int","text":"Int"},"value":2},{"kind":"name","name":"items","span":{"column":15,"end":292,"endColumn":20,"endLine":22,"file":0,"line":22,"start":287},"type":{"args":[{"kind":"Int","text":"Int"}],"kind":"List","text":"List<Int>"}},{"kind":"binary","left":25,"op":"+","right":26,"span":{"column":9,"end":311,"endColumn":17,"endLine":23,"file":0,"line":23,"start":303},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":9,"end":304,"endColumn":10,"endLine":23,"file":0,"line":23,"start":303},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"item","span":{"column":13,"end":311,"endColumn":17,"endLine":23,"file":0,"line":23,"start":307},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"table","span":{"column":23,"end":343,"endColumn":28,"endLine":25,"file":0,"line":25,"start":338},"type":{"args":[{"kind":"Text","text":"Text"},{"kind":"Int","text":"Int"}],"kind":"Map","text":"Map<Text, Int>"}},{"kind":"binary","left":29,"op":"-","right":30,"span":{"column":9,"end":363,"endColumn":18,"endLine":26,"file":0,"line":26,"start":354},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":9,"end":355,"endColumn":10,"endLine":26,"file":0,"line":26,"start":354},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"value","span":{"column":13,"end":363,"endColumn":18,"endLine":26,"file":0,"line":26,"start":358},"type":{"kind":"Int","text":"Int"}},{"args":[33],"callee":{"kind":"fn","module":"snip.stmts","name":"bump"},"function":32,"kind":"call","namedArgs":null,"span":{"column":3,"end":377,"endColumn":10,"endLine":28,"file":0,"line":28,"start":370},"type":{"kind":"Unit","text":"Unit"},"ufcs":false},{"kind":"name","name":"bump","span":{"column":3,"end":374,"endColumn":7,"endLine":28,"file":0,"line":28,"start":370},"type":{"kind":"Fn","params":[{"kind":"Int","text":"Int"}],"requires":null,"ret":{"kind":"Unit","text":"Unit"},"text":"fn(Int) -> Unit"}},{"kind":"name","name":"n","span":{"column":8,"end":376,"endColumn":9,"endLine":28,"file":0,"line":28,"start":375},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":3,"end":381,"endColumn":4,"endLine":29,"file":0,"line":29,"start":380},"type":{"kind":"Int","text":"Int"}},{"arms":[{"body":37,"pattern":3,"span":{"column":3,"end":457,"endColumn":15,"endLine":35,"file":0,"line":35,"start":445}},{"body":38,"pattern":4,"span":{"column":3,"end":483,"endColumn":26,"endLine":36,"file":0,"line":36,"start":460}}],"kind":"match","scrutinee":36,"span":{"column":29,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":433},"type":{"kind":"Text","text":"Text"}},{"kind":"name","name":"c","span":{"column":35,"end":440,"endColumn":36,"endLine":34,"file":0,"line":34,"start":439},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}},{"kind":"str","span":{"column":10,"end":457,"endColumn":15,"endLine":35,"file":0,"line":35,"start":452},"type":{"kind":"Text","text":"Text"},"value":"red"},{"kind":"str","span":{"column":19,"end":483,"endColumn":26,"endLine":36,"file":0,"line":36,"start":476},"type":{"kind":"Text","text":"Text"},"value":"other"},{"arms":[{"body":41,"pattern":7,"span":{"column":3,"end":534,"endColumn":11,"endLine":40,"file":0,"line":40,"start":526}},{"body":42,"pattern":8,"span":{"column":3,"end":543,"endColumn":9,"endLine":41,"file":0,"line":41,"start":537}}],"kind":"match","scrutinee":40,"span":{"column":28,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":514},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"c","span":{"column":34,"end":521,"endColumn":35,"endLine":39,"file":0,"line":39,"start":520},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}},{"kind":"int","span":{"column":10,"end":534,"endColumn":11,"endLine":40,"file":0,"line":40,"start":533},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"int","span":{"column":8,"end":543,"endColumn":9,"endLine":41,"file":0,"line":41,"start":542},"type":{"kind":"Int","text":"Int"},"value":2}],"files":["stmts.ignite"],"formatVersion":"ignite-typed/0.1","imports":[],"module":"snip.stmts","package":"snip.stmts","patterns":[{"items":[1,2],"kind":"tuple","span":{"column":7,"end":334,"endColumn":19,"endLine":25,"file":0,"line":25,"start":322}},{"bindingType":{"kind":"Text","text":"Text"},"kind":"binding","name":"key","span":{"column":8,"end":326,"endColumn":11,"endLine":25,"file":0,"line":25,"start":323}},{"bindingType":{"kind":"Int","text":"Int"},"kind":"binding","name":"value","span":{"column":13,"end":333,"endColumn":18,"endLine":25,"file":0,"line":25,"start":328}},{"args":[],"constant":null,"kind":"variant","path":["Red"],"span":{"column":3,"end":448,"endColumn":6,"endLine":35,"file":0,"line":35,"start":445}},{"items":[5,6],"kind":"or","span":{"column":3,"end":472,"endColumn":15,"endLine":36,"file":0,"line":36,"start":460}},{"args":[],"constant":null,"kind":"variant","path":["Green"],"span":{"column":3,"end":465,"endColumn":8,"endLine":36,"file":0,"line":36,"start":460}},{"args":[],"constant":null,"kind":"variant","path":["Blue"],"span":{"column":11,"end":472,"endColumn":15,"endLine":36,"file":0,"line":36,"start":468}},{"args":[],"constant":null,"kind":"variant","path":["Red"],"span":{"column":3,"end":529,"endColumn":6,"endLine":40,"file":0,"line":40,"start":526}},{"kind":"wildcard","span":{"column":3,"end":538,"endColumn":4,"endLine":41,"file":0,"line":41,"start":537}}],"stmts":[{"bindingType":{"kind":"Int","text":"Int"},"declaredType":null,"kind":"let","mutable":false,"name":"a","span":{"column":3,"end":143,"endColumn":16,"endLine":10,"file":0,"line":10,"start":130},"value":0},{"bindingType":{"kind":"Int","text":"Int"},"declaredType":null,"kind":"let","mutable":true,"name":"n","span":{"column":3,"end":155,"endColumn":12,"endLine":11,"file":0,"line":11,"start":146},"value":1},{"kind":"assign","span":{"column":3,"end":167,"endColumn":12,"endLine":12,"file":0,"line":12,"start":158},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":3,"end":159,"endColumn":4,"endLine":12,"file":0,"line":12,"start":158}},"value":2},{"kind":"assign","span":{"column":3,"end":179,"endColumn":12,"endLine":13,"file":0,"line":13,"start":170},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":3,"end":171,"endColumn":4,"endLine":13,"file":0,"line":13,"start":170}},"value":5},{"kind":"assign","span":{"column":3,"end":191,"endColumn":12,"endLine":14,"file":0,"line":14,"start":182},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":3,"end":183,"endColumn":4,"endLine":14,"file":0,"line":14,"start":182}},"value":8},{"expr":11,"kind":"expr","span":{"column":3,"end":272,"endColumn":4,"endLine":21,"file":0,"line":15,"start":194}},{"kind":"assign","span":{"column":5,"end":214,"endColumn":10,"endLine":16,"file":0,"line":16,"start":209},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":210,"endColumn":6,"endLine":16,"file":0,"line":16,"start":209}},"value":15},{"kind":"return","span":{"column":5,"end":247,"endColumn":13,"endLine":18,"file":0,"line":18,"start":239},"value":20},{"kind":"assign","span":{"column":5,"end":268,"endColumn":10,"endLine":20,"file":0,"line":20,"start":263},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":264,"endColumn":6,"endLine":20,"file":0,"line":20,"start":263}},"value":22},{"bindingType":{"kind":"Int","text":"Int"},"body":{"span":{"column":21,"end":315,"endColumn":4,"endLine":24,"file":0,"line":22,"start":293},"stmts":[10]},"iter":23,"kind":"for","name":"item","span":{"column":3,"end":315,"endColumn":4,"endLine":24,"file":0,"line":22,"start":275}},{"kind":"assign","span":{"column":5,"end":311,"endColumn":17,"endLine":23,"file":0,"line":23,"start":299},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":300,"endColumn":6,"endLine":23,"file":0,"line":23,"start":299}},"value":24},{"body":{"span":{"column":29,"end":367,"endColumn":4,"endLine":27,"file":0,"line":25,"start":344},"stmts":[12]},"iter":27,"kind":"forPattern","pattern":0,"span":{"column":3,"end":367,"endColumn":4,"endLine":27,"file":0,"line":25,"start":318}},{"kind":"assign","span":{"column":5,"end":363,"endColumn":18,"endLine":26,"file":0,"line":26,"start":350},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":351,"endColumn":6,"endLine":26,"file":0,"line":26,"start":350}},"value":28},{"expr":31,"kind":"expr","span":{"column":3,"end":377,"endColumn":10,"endLine":28,"file":0,"line":28,"start":370}},{"expr":34,"kind":"expr","span":{"column":3,"end":381,"endColumn":4,"endLine":29,"file":0,"line":29,"start":380}},{"expr":35,"kind":"expr","span":{"column":29,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":433}},{"expr":39,"kind":"expr","span":{"column":28,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":514}}]}"##
+test const STMTS_DOC: Text = r##"{"decls":[{"kind":"enum","name":"Color","span":{"column":1,"end":55,"endColumn":2,"endLine":7,"file":0,"line":3,"start":20},"testOnly":false,"typeParams":[],"variants":[{"name":"Red","payload":[],"span":{"column":3,"end":38,"endColumn":6,"endLine":4,"file":0,"line":4,"start":35}},{"name":"Green","payload":[],"span":{"column":3,"end":46,"endColumn":8,"endLine":5,"file":0,"line":5,"start":41}},{"name":"Blue","payload":[],"span":{"column":3,"end":53,"endColumn":7,"endLine":6,"file":0,"line":6,"start":49}}]},{"body":{"span":{"column":70,"end":383,"endColumn":2,"endLine":30,"file":0,"line":9,"start":126},"stmts":[0,1,2,3,4,5,9,11,13,14]},"bounds":[],"effectful":false,"kind":"fn","name":"steps","owner":null,"params":[{"name":"start","span":{"column":10,"end":76,"endColumn":20,"endLine":9,"file":0,"line":9,"start":66},"type":{"kind":"Int","text":"Int"}},{"name":"items","span":{"column":22,"end":94,"endColumn":38,"endLine":9,"file":0,"line":9,"start":78},"type":{"args":[{"kind":"Int","text":"Int"}],"kind":"List","text":"List<Int>"}},{"name":"table","span":{"column":40,"end":117,"endColumn":61,"endLine":9,"file":0,"line":9,"start":96},"type":{"args":[{"kind":"Text","text":"Text"},{"kind":"Int","text":"Int"}],"kind":"Map","text":"Map<Text, Int>"}}],"qualifiedName":"steps","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":383,"endColumn":2,"endLine":30,"file":0,"line":9,"start":57},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":17,"end":403,"endColumn":19,"endLine":32,"file":0,"line":32,"start":401},"stmts":[]},"bounds":[],"effectful":false,"kind":"fn","name":"bump","owner":null,"params":[{"name":"n","span":{"column":9,"end":399,"endColumn":15,"endLine":32,"file":0,"line":32,"start":393},"type":{"kind":"Int","text":"Int"}}],"qualifiedName":"bump","requires":null,"ret":{"kind":"Unit","text":"Unit"},"satisfies":[],"span":{"column":1,"end":403,"endColumn":19,"endLine":32,"file":0,"line":32,"start":385},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":29,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":433},"stmts":[15]},"bounds":[],"effectful":false,"kind":"fn","name":"name","owner":null,"params":[{"name":"c","span":{"column":9,"end":421,"endColumn":17,"endLine":34,"file":0,"line":34,"start":413},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}}],"qualifiedName":"name","requires":null,"ret":{"kind":"Text","text":"Text"},"satisfies":[],"span":{"column":1,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":405},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":28,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":514},"stmts":[16]},"bounds":[],"effectful":false,"kind":"fn","name":"pick","owner":null,"params":[{"name":"c","span":{"column":9,"end":503,"endColumn":17,"endLine":39,"file":0,"line":39,"start":495},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}}],"qualifiedName":"pick","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":487},"testOnly":false,"typeParams":[]}],"exprs":[{"kind":"name","name":"start","span":{"column":11,"end":143,"endColumn":16,"endLine":10,"file":0,"line":10,"start":138},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"a","span":{"column":11,"end":155,"endColumn":12,"endLine":11,"file":0,"line":11,"start":154},"type":{"kind":"Int","text":"Int"}},{"kind":"binary","left":3,"op":"+","right":4,"span":{"column":7,"end":167,"endColumn":12,"endLine":12,"file":0,"line":12,"start":162},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":7,"end":163,"endColumn":8,"endLine":12,"file":0,"line":12,"start":162},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":11,"end":167,"endColumn":12,"endLine":12,"file":0,"line":12,"start":166},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"binary","left":6,"op":"-","right":7,"span":{"column":7,"end":179,"endColumn":12,"endLine":13,"file":0,"line":13,"start":174},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":7,"end":175,"endColumn":8,"endLine":13,"file":0,"line":13,"start":174},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":11,"end":179,"endColumn":12,"endLine":13,"file":0,"line":13,"start":178},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"binary","left":9,"op":"*","right":10,"span":{"column":7,"end":191,"endColumn":12,"endLine":14,"file":0,"line":14,"start":186},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":7,"end":187,"endColumn":8,"endLine":14,"file":0,"line":14,"start":186},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":11,"end":191,"endColumn":12,"endLine":14,"file":0,"line":14,"start":190},"type":{"kind":"Int","text":"Int"},"value":2},{"cond":12,"else":16,"kind":"if","span":{"column":3,"end":272,"endColumn":4,"endLine":21,"file":0,"line":15,"start":194},"then":{"span":{"column":12,"end":218,"endColumn":4,"endLine":17,"file":0,"line":15,"start":203},"stmts":[6]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":13,"op":">","right":14,"span":{"column":6,"end":202,"endColumn":11,"endLine":15,"file":0,"line":15,"start":197},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"n","span":{"column":6,"end":198,"endColumn":7,"endLine":15,"file":0,"line":15,"start":197},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":10,"end":202,"endColumn":11,"endLine":15,"file":0,"line":15,"start":201},"type":{"kind":"Int","text":"Int"},"value":3},{"kind":"int","span":{"column":9,"end":214,"endColumn":10,"endLine":16,"file":0,"line":16,"start":213},"type":{"kind":"Int","text":"Int"},"value":0},{"cond":17,"else":21,"kind":"if","span":{"column":10,"end":272,"endColumn":4,"endLine":21,"file":0,"line":17,"start":224},"then":{"span":{"column":19,"end":251,"endColumn":4,"endLine":19,"file":0,"line":17,"start":233},"stmts":[7]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":18,"op":"<","right":19,"span":{"column":13,"end":232,"endColumn":18,"endLine":17,"file":0,"line":17,"start":227},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"n","span":{"column":13,"end":228,"endColumn":14,"endLine":17,"file":0,"line":17,"start":227},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":17,"end":232,"endColumn":18,"endLine":17,"file":0,"line":17,"start":231},"type":{"kind":"Int","text":"Int"},"value":0},{"kind":"int","span":{"column":12,"end":247,"endColumn":13,"endLine":18,"file":0,"line":18,"start":246},"type":{"kind":"Int","text":"Int"},"value":1},{"block":{"span":{"column":10,"end":272,"endColumn":4,"endLine":21,"file":0,"line":19,"start":257},"stmts":[8]},"kind":"block","span":{"column":10,"end":272,"endColumn":4,"endLine":21,"file":0,"line":19,"start":257},"type":{"kind":"Unit","text":"Unit"}},{"kind":"int","span":{"column":9,"end":268,"endColumn":10,"endLine":20,"file":0,"line":20,"start":267},"type":{"kind":"Int","text":"Int"},"value":2},{"kind":"name","name":"items","span":{"column":15,"end":292,"endColumn":20,"endLine":22,"file":0,"line":22,"start":287},"type":{"args":[{"kind":"Int","text":"Int"}],"kind":"List","text":"List<Int>"}},{"kind":"binary","left":25,"op":"+","right":26,"span":{"column":9,"end":311,"endColumn":17,"endLine":23,"file":0,"line":23,"start":303},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":9,"end":304,"endColumn":10,"endLine":23,"file":0,"line":23,"start":303},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"item","span":{"column":13,"end":311,"endColumn":17,"endLine":23,"file":0,"line":23,"start":307},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"table","span":{"column":23,"end":343,"endColumn":28,"endLine":25,"file":0,"line":25,"start":338},"type":{"args":[{"kind":"Text","text":"Text"},{"kind":"Int","text":"Int"}],"kind":"Map","text":"Map<Text, Int>"}},{"kind":"binary","left":29,"op":"-","right":30,"span":{"column":9,"end":363,"endColumn":18,"endLine":26,"file":0,"line":26,"start":354},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":9,"end":355,"endColumn":10,"endLine":26,"file":0,"line":26,"start":354},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"value","span":{"column":13,"end":363,"endColumn":18,"endLine":26,"file":0,"line":26,"start":358},"type":{"kind":"Int","text":"Int"}},{"args":[33],"callee":{"kind":"fn","module":"snip.stmts","name":"bump"},"function":32,"kind":"call","namedArgs":null,"span":{"column":3,"end":377,"endColumn":10,"endLine":28,"file":0,"line":28,"start":370},"type":{"kind":"Unit","text":"Unit"},"ufcs":false},{"kind":"name","name":"bump","span":{"column":3,"end":374,"endColumn":7,"endLine":28,"file":0,"line":28,"start":370},"type":{"kind":"Fn","params":[{"kind":"Int","text":"Int"}],"requires":null,"ret":{"kind":"Unit","text":"Unit"},"text":"fn(Int) -> Unit"}},{"kind":"name","name":"n","span":{"column":8,"end":376,"endColumn":9,"endLine":28,"file":0,"line":28,"start":375},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":3,"end":381,"endColumn":4,"endLine":29,"file":0,"line":29,"start":380},"type":{"kind":"Int","text":"Int"}},{"arms":[{"body":37,"pattern":3,"span":{"column":3,"end":468,"endColumn":26,"endLine":35,"file":0,"line":35,"start":445}},{"body":38,"pattern":6,"span":{"column":3,"end":483,"endColumn":15,"endLine":36,"file":0,"line":36,"start":471}}],"kind":"match","scrutinee":36,"span":{"column":29,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":433},"type":{"kind":"Text","text":"Text"}},{"kind":"name","name":"c","span":{"column":35,"end":440,"endColumn":36,"endLine":34,"file":0,"line":34,"start":439},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}},{"kind":"str","span":{"column":19,"end":468,"endColumn":26,"endLine":35,"file":0,"line":35,"start":461},"type":{"kind":"Text","text":"Text"},"value":"other"},{"kind":"str","span":{"column":10,"end":483,"endColumn":15,"endLine":36,"file":0,"line":36,"start":478},"type":{"kind":"Text","text":"Text"},"value":"red"},{"arms":[{"body":41,"pattern":7,"span":{"column":3,"end":534,"endColumn":11,"endLine":40,"file":0,"line":40,"start":526}},{"body":42,"pattern":8,"span":{"column":3,"end":543,"endColumn":9,"endLine":41,"file":0,"line":41,"start":537}}],"kind":"match","scrutinee":40,"span":{"column":28,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":514},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"c","span":{"column":34,"end":521,"endColumn":35,"endLine":39,"file":0,"line":39,"start":520},"type":{"args":[],"kind":"Enum","module":"snip.stmts","name":"Color","text":"Color"}},{"kind":"int","span":{"column":10,"end":534,"endColumn":11,"endLine":40,"file":0,"line":40,"start":533},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"int","span":{"column":8,"end":543,"endColumn":9,"endLine":41,"file":0,"line":41,"start":542},"type":{"kind":"Int","text":"Int"},"value":2}],"files":["stmts.ignite"],"formatVersion":"ignite-typed/0.1","imports":[],"module":"snip.stmts","package":"snip.stmts","patterns":[{"items":[1,2],"kind":"tuple","span":{"column":7,"end":334,"endColumn":19,"endLine":25,"file":0,"line":25,"start":322}},{"bindingType":{"kind":"Text","text":"Text"},"kind":"binding","name":"key","span":{"column":8,"end":326,"endColumn":11,"endLine":25,"file":0,"line":25,"start":323}},{"bindingType":{"kind":"Int","text":"Int"},"kind":"binding","name":"value","span":{"column":13,"end":333,"endColumn":18,"endLine":25,"file":0,"line":25,"start":328}},{"items":[4,5],"kind":"or","span":{"column":3,"end":457,"endColumn":15,"endLine":35,"file":0,"line":35,"start":445}},{"args":[],"constant":null,"kind":"variant","path":["Green"],"span":{"column":3,"end":450,"endColumn":8,"endLine":35,"file":0,"line":35,"start":445}},{"args":[],"constant":null,"kind":"variant","path":["Blue"],"span":{"column":11,"end":457,"endColumn":15,"endLine":35,"file":0,"line":35,"start":453}},{"args":[],"constant":null,"kind":"variant","path":["Red"],"span":{"column":3,"end":474,"endColumn":6,"endLine":36,"file":0,"line":36,"start":471}},{"args":[],"constant":null,"kind":"variant","path":["Red"],"span":{"column":3,"end":529,"endColumn":6,"endLine":40,"file":0,"line":40,"start":526}},{"kind":"wildcard","span":{"column":3,"end":538,"endColumn":4,"endLine":41,"file":0,"line":41,"start":537}}],"stmts":[{"bindingType":{"kind":"Int","text":"Int"},"declaredType":null,"kind":"let","mutable":false,"name":"a","span":{"column":3,"end":143,"endColumn":16,"endLine":10,"file":0,"line":10,"start":130},"value":0},{"bindingType":{"kind":"Int","text":"Int"},"declaredType":null,"kind":"let","mutable":true,"name":"n","span":{"column":3,"end":155,"endColumn":12,"endLine":11,"file":0,"line":11,"start":146},"value":1},{"kind":"assign","span":{"column":3,"end":167,"endColumn":12,"endLine":12,"file":0,"line":12,"start":158},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":3,"end":159,"endColumn":4,"endLine":12,"file":0,"line":12,"start":158}},"value":2},{"kind":"assign","span":{"column":3,"end":179,"endColumn":12,"endLine":13,"file":0,"line":13,"start":170},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":3,"end":171,"endColumn":4,"endLine":13,"file":0,"line":13,"start":170}},"value":5},{"kind":"assign","span":{"column":3,"end":191,"endColumn":12,"endLine":14,"file":0,"line":14,"start":182},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":3,"end":183,"endColumn":4,"endLine":14,"file":0,"line":14,"start":182}},"value":8},{"expr":11,"kind":"expr","span":{"column":3,"end":272,"endColumn":4,"endLine":21,"file":0,"line":15,"start":194}},{"kind":"assign","span":{"column":5,"end":214,"endColumn":10,"endLine":16,"file":0,"line":16,"start":209},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":210,"endColumn":6,"endLine":16,"file":0,"line":16,"start":209}},"value":15},{"kind":"return","span":{"column":5,"end":247,"endColumn":13,"endLine":18,"file":0,"line":18,"start":239},"value":20},{"kind":"assign","span":{"column":5,"end":268,"endColumn":10,"endLine":20,"file":0,"line":20,"start":263},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":264,"endColumn":6,"endLine":20,"file":0,"line":20,"start":263}},"value":22},{"bindingType":{"kind":"Int","text":"Int"},"body":{"span":{"column":21,"end":315,"endColumn":4,"endLine":24,"file":0,"line":22,"start":293},"stmts":[10]},"iter":23,"kind":"for","name":"item","span":{"column":3,"end":315,"endColumn":4,"endLine":24,"file":0,"line":22,"start":275}},{"kind":"assign","span":{"column":5,"end":311,"endColumn":17,"endLine":23,"file":0,"line":23,"start":299},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":300,"endColumn":6,"endLine":23,"file":0,"line":23,"start":299}},"value":24},{"body":{"span":{"column":29,"end":367,"endColumn":4,"endLine":27,"file":0,"line":25,"start":344},"stmts":[12]},"iter":27,"kind":"forPattern","pattern":0,"span":{"column":3,"end":367,"endColumn":4,"endLine":27,"file":0,"line":25,"start":318}},{"kind":"assign","span":{"column":5,"end":363,"endColumn":18,"endLine":26,"file":0,"line":26,"start":350},"target":{"base":"n","fields":[],"ownerType":null,"span":{"column":5,"end":351,"endColumn":6,"endLine":26,"file":0,"line":26,"start":350}},"value":28},{"expr":31,"kind":"expr","span":{"column":3,"end":377,"endColumn":10,"endLine":28,"file":0,"line":28,"start":370}},{"expr":34,"kind":"expr","span":{"column":3,"end":381,"endColumn":4,"endLine":29,"file":0,"line":29,"start":380}},{"expr":35,"kind":"expr","span":{"column":29,"end":485,"endColumn":2,"endLine":37,"file":0,"line":34,"start":433}},{"expr":39,"kind":"expr","span":{"column":28,"end":545,"endColumn":2,"endLine":42,"file":0,"line":39,"start":514}}]}"##
 
 test const EXPRS_SRC: Text = r##"package snip.exprs
 

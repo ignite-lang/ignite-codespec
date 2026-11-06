@@ -1,0 +1,191 @@
+{
+  "format": "cir/1",
+  "name": "builds",
+  "reader": {
+    "language": "ignite",
+    "name": "codespec-read-ignite",
+    "version": "0.0.0"
+  },
+  "types": [
+    {
+      "k": "enum",
+      "name": "Color",
+      "exported": true,
+      "under": {
+        "k": "int",
+        "width": "platform",
+        "signed": true
+      },
+      "variants": [
+        {
+          "name": "Red",
+          "value": {
+            "k": "lit",
+            "value": "0",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        },
+        {
+          "name": "Green",
+          "value": {
+            "k": "lit",
+            "value": "1",
+            "t": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "pos": "builds.ignite:10"
+    }
+  ],
+  "funcs": [
+    {
+      "name": "size",
+      "exported": true,
+      "params": [
+        {
+          "name": "xs",
+          "t": {
+            "k": "slice",
+            "elem": {
+              "k": "int",
+              "width": "platform",
+              "signed": true
+            }
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "int",
+          "width": "platform",
+          "signed": true
+        }
+      ],
+      "body": [
+        {
+          "k": "return",
+          "results": [
+            {
+              "k": "intrinsic",
+              "name": "len",
+              "args": [
+                {
+                  "k": "var",
+                  "name": "xs",
+                  "t": {
+                    "k": "slice",
+                    "elem": {
+                      "k": "int",
+                      "width": "platform",
+                      "signed": true
+                    }
+                  }
+                }
+              ],
+              "t": {
+                "k": "int",
+                "width": "platform",
+                "signed": true
+              }
+            }
+          ],
+          "pos": "builds.ignite:16"
+        }
+      ],
+      "pos": "builds.ignite:16"
+    },
+    {
+      "name": "name",
+      "exported": true,
+      "params": [
+        {
+          "name": "c",
+          "t": {
+            "k": "named",
+            "name": "Color"
+          }
+        }
+      ],
+      "results": [
+        {
+          "k": "string"
+        }
+      ],
+      "body": [
+        {
+          "k": "switch",
+          "tag": {
+            "k": "var",
+            "name": "c",
+            "t": {
+              "k": "named",
+              "name": "Color"
+            }
+          },
+          "cases": [
+            {
+              "values": [
+                {
+                  "k": "const",
+                  "name": "Red",
+                  "t": {
+                    "k": "named",
+                    "name": "Color"
+                  }
+                }
+              ],
+              "body": [
+                {
+                  "k": "return",
+                  "results": [
+                    {
+                      "k": "lit",
+                      "value": "\"red\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    }
+                  ],
+                  "pos": "builds.ignite:20"
+                }
+              ]
+            },
+            {
+              "values": [],
+              "body": [
+                {
+                  "k": "return",
+                  "results": [
+                    {
+                      "k": "lit",
+                      "value": "\"green\"",
+                      "t": {
+                        "k": "string"
+                      }
+                    }
+                  ],
+                  "pos": "builds.ignite:21"
+                }
+              ]
+            }
+          ],
+          "pos": "builds.ignite:19"
+        }
+      ],
+      "pos": "builds.ignite:19"
+    }
+  ],
+  "layout": [
+    "type:Color",
+    "func:size",
+    "func:name"
+  ]
+}

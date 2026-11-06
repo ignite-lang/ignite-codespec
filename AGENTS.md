@@ -28,6 +28,7 @@ Ignite adapters for codespec's `cir/1`: `codespec-write-ignite` (`cir/1` → Ign
   hand, regenerate it with the generator change.
 - Strict reading, canonical writing, deterministic output: the same input gives the same bytes.
 - What an adapter cannot express is refused with a position and a reason, never approximated.
+- Exception: a program that traps in its source language (Ignite Int overflow) may be written as one that does not; nothing else is approximated.
 - A translation is accepted by codespec's comparison harness only, never by a claim.
 - No comments in `Taskfile.yml` or any other config file.
 - Commit titles follow Conventional Commits; every commit has a bullet body.

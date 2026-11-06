@@ -1,9 +1,9 @@
 package valuesdriver.values
 
-// Adversary cases of `codespec-read-ignite` (story ignite-reader): Ignite programs the reader
-// reads without a refusal whose cir/1 module means something else. The harness of this example
-// runs this file and the Go that `codespec write --lang go` writes from the reader's document
-// (`codespec pass` between) and compares their output; the inline test pins Ignite's values.
+// Adversary cases of `codespec-read-ignite` (story ignite-reader): Ignite programs whose cir/1
+// module would mean something else, or that Go would not build. The reader refuses each, with
+// its position and reason; `examples/reader-values/values.cir.json` holds the document and
+// `task reader-values` compares it. The inline test pins Ignite's values.
 
 type Bag {
   items: Map<Text, Int>
@@ -72,6 +72,20 @@ fn arm_bind(x: Int) -> Text = match x {
   1 => "one"
 }
 
+// A `let` that shadows one of the same block (Go's := would declare no new variable).
+fn bump(a: Int) -> Int {
+  let x = a
+  let x = x + 1
+  x
+}
+
+type Pair {
+  xs: List<Int>
+}
+
+// Records and lists compare by value in Ignite; Go cannot compare a struct holding a slice.
+fn same(a: Pair, b: Pair) -> Bool = a == b
+
 test "the values Ignite gives" {
   assert alias_list() == 9
   assert alias_map() == 1
@@ -79,4 +93,6 @@ test "the values Ignite gives" {
   assert record_map() == 0
   assert arm_wild(1) == "any"
   assert arm_bind(1) == "any 1"
+  assert bump(1) == 2
+  assert same(Pair { xs = [1] }, Pair { xs = [1] })
 }

@@ -13,7 +13,7 @@
       "exported": true,
       "under": {
         "k": "int",
-        "width": "64",
+        "width": "platform",
         "signed": true
       },
       "variants": [
@@ -24,7 +24,7 @@
             "value": "0",
             "t": {
               "k": "int",
-              "width": "64",
+              "width": "platform",
               "signed": true
             }
           }
@@ -36,7 +36,7 @@
             "value": "1",
             "t": {
               "k": "int",
-              "width": "64",
+              "width": "platform",
               "signed": true
             }
           }
@@ -48,7 +48,7 @@
             "value": "2",
             "t": {
               "k": "int",
-              "width": "64",
+              "width": "platform",
               "signed": true
             }
           }
@@ -60,7 +60,7 @@
             "value": "3",
             "t": {
               "k": "int",
-              "width": "64",
+              "width": "platform",
               "signed": true
             }
           }
@@ -89,7 +89,7 @@
           "name": "total",
           "t": {
             "k": "int",
-            "width": "64",
+            "width": "platform",
             "signed": true
           }
         },
@@ -174,7 +174,7 @@
               "name": "f2",
               "t": {
                 "k": "int",
-                "width": "64",
+                "width": "platform",
                 "signed": true
               }
             }
@@ -254,7 +254,7 @@
           "name": "seq",
           "t": {
             "k": "int",
-            "width": "64",
+            "width": "platform",
             "signed": true
           }
         }
@@ -317,7 +317,7 @@
                     "value": "0",
                     "t": {
                       "k": "int",
-                      "width": "64",
+                      "width": "platform",
                       "signed": true
                     }
                   }
@@ -445,16 +445,7 @@
               ]
             },
             {
-              "values": [
-                {
-                  "k": "const",
-                  "name": "Cancelled",
-                  "t": {
-                    "k": "named",
-                    "name": "Status"
-                  }
-                }
-              ],
+              "values": [],
               "body": [
                 {
                   "k": "return",
@@ -655,121 +646,10 @@
           "pos": "reference.ignite:106"
         },
         {
-          "k": "for_range",
-          "key": "_",
-          "val": "order",
-          "over": {
-            "k": "field",
-            "x": {
-              "k": "var",
-              "name": "ledger",
-              "t": {
-                "k": "named",
-                "name": "Ledger"
-              }
-            },
-            "name": "orders",
-            "t": {
-              "k": "map",
-              "key": {
-                "k": "string"
-              },
-              "elem": {
-                "k": "named",
-                "name": "Order"
-              }
-            }
-          },
-          "body": [
-            {
-              "k": "if",
-              "cond": {
-                "k": "binop",
-                "op": "==",
-                "x": {
-                  "k": "field",
-                  "x": {
-                    "k": "var",
-                    "name": "order",
-                    "t": {
-                      "k": "named",
-                      "name": "Order"
-                    }
-                  },
-                  "name": "status",
-                  "t": {
-                    "k": "named",
-                    "name": "Status"
-                  }
-                },
-                "y": {
-                  "k": "const",
-                  "name": "Pending",
-                  "t": {
-                    "k": "named",
-                    "name": "Status"
-                  }
-                },
-                "t": {
-                  "k": "bool"
-                }
-              },
-              "then": [
-                {
-                  "k": "assign",
-                  "lhs": [
-                    {
-                      "k": "var",
-                      "name": "out",
-                      "t": {
-                        "k": "slice",
-                        "elem": {
-                          "k": "named",
-                          "name": "Order"
-                        }
-                      }
-                    }
-                  ],
-                  "rhs": [
-                    {
-                      "k": "intrinsic",
-                      "name": "append",
-                      "args": [
-                        {
-                          "k": "var",
-                          "name": "out",
-                          "t": {
-                            "k": "slice",
-                            "elem": {
-                              "k": "named",
-                              "name": "Order"
-                            }
-                          }
-                        },
-                        {
-                          "k": "var",
-                          "name": "order",
-                          "t": {
-                            "k": "named",
-                            "name": "Order"
-                          }
-                        }
-                      ],
-                      "t": {
-                        "k": "slice",
-                        "elem": {
-                          "k": "named",
-                          "name": "Order"
-                        }
-                      }
-                    }
-                  ],
-                  "pos": "reference.ignite:109"
-                }
-              ],
-              "pos": "reference.ignite:108"
-            }
-          ],
+          "k": "foreign",
+          "lang": "ignite",
+          "src": "for (_, order) in ledger.orders {\n    if order.status == Pending {\n      out.push(order)\n    }\n  }",
+          "reason": "a loop over a map: Ignite's runs in key order, cir/1's in no order",
           "pos": "reference.ignite:107"
         },
         {
@@ -952,6 +832,11 @@
       "pos": "reference.ignite:94",
       "what": "cancel",
       "reason": "result: the generic type `Step<Unit>`: cir/1 has no type parameters"
+    },
+    {
+      "pos": "reference.ignite:107",
+      "what": "for (_, order) in ledger.orders { …",
+      "reason": "a loop over a map: Ignite's runs in key order, cir/1's in no order"
     },
     {
       "pos": "reference.ignite:122",
