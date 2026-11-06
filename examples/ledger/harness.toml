@@ -12,3 +12,8 @@ run = ["{build}/reference/bin/ledger-reference"]
 name = "ignite"
 build = ["ignite", "build", "drivers/ignite-out/driver.ignite", "--out", "{build}/ignite"]
 run = ["{build}/ignite/bin/ledger-ignite"]
+
+[[implementation]]
+name = "roundtrip"
+build = ["ignite", "build", "drivers/roundtrip/driver.ignite", "--out", "{build}/roundtrip"]
+run = ["{build}/roundtrip/bin/ledger-roundtrip"]

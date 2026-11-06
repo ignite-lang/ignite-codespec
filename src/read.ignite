@@ -12,7 +12,7 @@ import codespec.cir.{
   NilExpr, VarExpr, ConstExpr, ErrvarExpr, FieldExpr, IndexExpr, CallExpr, MethodExpr,
   BinopExpr, UnopExpr, StructExpr, MakeExpr, ZeroExpr, IntrinsicExpr, LetStmt, AssignStmt,
   IncrStmt, DecrStmt, IfStmt, ForRangeStmt, SwitchStmt, ReturnStmt, ExprStmt, LookupElseStmt,
-  ForeignStmt
+  ForeignStmt, PtrType, ToErrorExpr
 }
 
 // `codespec-read-ignite SOURCE`: reads one Ignite source file and prints it as one cir/1
@@ -35,6 +35,7 @@ import codespec.cir.{
 // | enum with payloads | `union`, payload fields `f0`, `f1`, … |
 // | `type T = U` | `newtype` (the document resolves aliases, so a use reads as `U`) |
 // | `fn T.m(r: T, ..)` | method `T.m` with receiver `r`; an associated fn without one is the function `m` |
+// | `fn T.m(r: T, ..) -> T` or `-> (T, R)` starting `var r = r`, returning `r` or `(r, v)` (the writer's form) | method with receiver `r *T` and the results of `R`; a call of it in the module is refused |
 // | `let`, `var` with a value | `let` |
 // | `x = e`; `x = x + 1`, `x = x - 1` | `assign`; `incr`, `decr` |
 // | `if`, `for x in` a list, `match` on constants (catch-all last), `return`, a call | `if`, `for_range`, `switch`, `return`, `expr` |
@@ -42,10 +43,12 @@ import codespec.cir.{
 // | `let x = match m.get(k) { Some(x) => x, None => { .. return } }` | `lookup_else` |
 // | `xs.push(v)`, `m.put(k, v)`, `.len()`, `Map.empty()`, `[]` | `append`, map assignment, `len`, `make` |
 // | `"{n}"` (an `Int` or `Bool` shown in text) | `sprintf` with `%d` or `%t` |
-// | `Result<T, Error>` of the writer's `enum Error` | `(T, error)`: its variants without payload are sentinels, `Msg(t)` is `errorf` |
+// | `Result<T, Error>` of the writer's `enum Error` | `(T, error)`: its variants without payload are sentinels, `Msg(t)` is `errorf`, `V(v)` of a record `V` with `fn V.error` is `v` as an error and `V.error` the method `V.Error` |
 // | `Option<T>` result | `(T, bool)` |
 // | `wrapping_add(a, b)`, `wrapping_sub(a, b)` (the writer's helpers) | `+`, `-` |
-// | `while`, `loop`, a loop over a map, `?`, closures, `assert`, data in patterns, generics, `spawn`, systems; a list or map Go would share where Ignite copies; a `let` its block already declares; `==` on lists, maps or unions | `foreign` statement or a refused declaration |
+// | `for (k, v) in unordered(m)` (the writer's helper) | `for_range` over a map |
+// | `E.V`; `E.value(x)` of an enum over `Text` | the constant `V`; `sprintf("%s", x)` |
+// | `while`, `loop`, a loop over a map other than `unordered(m)`, `?`, closures, `assert`, data in patterns, generics, `spawn`, systems; a list or map Go would share where Ignite copies; a `let` its block already declares; `==` on lists, maps or unions | `foreign` statement or a refused declaration |
 //
 // Tests and test-only items are not part of the module and are not read. The integer
 // operators of Ignite trap on overflow where cir/1's (Go's) wrap: a program that traps reads as one
@@ -283,6 +286,11 @@ type Model {
   // The writer's `enum Error`: its sentinels, and whether `Msg(Text)` is one of its variants.
   error: Bool
   sentinels: List<Text>
+  // The records `enum Error` carries as `V(V)`, Go's error types: `fn V.error` is `V.Error`.
+  error_types: List<Text>
+  // Methods that return their receiver after the call (`fn T.m(r: T, ..) -> (T, ..)`
+  // starting `var r = r`): the writer's form of a method with a pointer receiver.
+  threaded: List<Text>
 }
 
 fn find_struct(m: Model, name: Text) -> Option<StructTypeDecl> {
@@ -445,15 +453,16 @@ fn payload_free(decl: Json) -> Bool {
   true
 }
 
-// Whether `decl` is the writer's `enum Error`: variants without payload and `Msg(Text)`, with
-// `fn Error.text` mapping each variant without payload to a text literal.
+// Whether `decl` is the writer's `enum Error`: variants without payload, `Msg(Text)` and
+// `V(V)` for a record `V` of the module with `fn V.error(e: V) -> Text`, with `fn Error.text`
+// mapping each variant without payload to a text literal.
 fn writer_error(d: Doc, decl: Json) -> Bool {
   if str(decl, "name") != "Error" || !items(decl, "typeParams").is_empty() {
     return false
   }
   for v in items(decl, "variants") {
     let payload = items(v, "payload")
-    if !payload.is_empty() && !(str(v, "name") == "Msg" && payload.len() == 1 && str(payload[0], "kind") == "Text") {
+    if !payload.is_empty() && !(str(v, "name") == "Msg" && payload.len() == 1 && str(payload[0], "kind") == "Text") && !is_error_type(d, v) {
       return false
     }
   }
@@ -474,6 +483,32 @@ fn writer_error(d: Doc, decl: Json) -> Bool {
     }
     None => false
   }
+}
+
+// Whether the variant `v` of `enum Error` is `V(V)` for a record `V` of the module with
+// `fn V.error(e: V) -> Text`: the writer's form of a Go error type.
+fn is_error_type(d: Doc, v: Json) -> Bool {
+  let name = str(v, "name")
+  let payload = items(v, "payload")
+  if payload.len() != 1 || str(payload[0], "kind") != "Record" || str(payload[0], "name") != name || str(payload[0], "module") != d.module {
+    return false
+  }
+  match fn_decl(d, name + ".error") {
+    Some(f) => {
+      let params = items(f, "params")
+      params.len() == 1 && str(member(params[0], "type"), "name") == name && str(member(f, "ret"), "kind") == "Text" && items(f, "typeParams").is_empty()
+    }
+    None => false
+  }
+}
+
+// The cir/1 name of the module's fn `qualified`: `error` of an error type is Go's `Error`.
+fn cir_name(m: Model, qualified: Text) -> Text {
+  let name = last_segment(qualified)
+  if name == "error" && has(m.error_types.map(|t| t + ".error"), qualified) {
+    return "Error"
+  }
+  name
 }
 
 // The message `fn Error.text` gives the sentinel `name`.
@@ -506,6 +541,56 @@ fn is_wrapping_helper(decl: Json) -> Bool {
   }
   let params = items(decl, "params")
   params.len() == 2 && str(member(params[0], "type"), "kind") == "Int" && str(member(params[1], "type"), "kind") == "Int" && str(member(decl, "ret"), "kind") == "Int"
+}
+
+// The writer's helper `fn unordered<T>(m: T) -> T = m`, exactly the identity: a loop over
+// `unordered(m)` declares that its order is not part of what the function does, which is
+// cir/1's range over a map. Any other body (one with an effect, say) leaves the helper a
+// generic function, refused, and its loops plain map loops, refused.
+fn is_unordered_helper(d: Doc, decl: Json) -> Bool {
+  let params = items(decl, "params")
+  if str(decl, "qualifiedName") != "unordered" || items(decl, "typeParams").len() != 1 || params.len() != 1 || str(member(params[0], "type"), "kind") != "Param" || str(member(decl, "ret"), "kind") != "Param" {
+    return false
+  }
+  match sole_expr(d, decl) {
+    Some(body) => str(body, "kind") == "name" && str(body, "name") == str(params[0], "name")
+    None => false
+  }
+}
+
+// Whether the fn `decl` is the writer's form of a method with a pointer receiver: `fn T.m(r:
+// T, ..) -> T` or `-> (T, R)` whose body starts `var r = r`.
+fn is_threaded(d: Doc, decl: Json) -> Bool {
+  if !is_method(decl) || thread_ret(decl) == None {
+    return false
+  }
+  let r = str(items(decl, "params")[0], "name")
+  let body = indexes(member(decl, "body"), "stmts")
+  if body.is_empty() {
+    return false
+  }
+  let first = stmt_node(d, body[0])
+  if str(first, "kind") != "let" || !flag(first, "mutable") || str(first, "name") != r {
+    return false
+  }
+  let value = expr_node(d, num(first, "value"))
+  str(value, "kind") == "name" && str(value, "name") == r
+}
+
+// The result type of a method returning its receiver, without the receiver: `Unit` for `-> T`,
+// `R` for `-> (T, R)`; `None` for any other result.
+fn thread_ret(decl: Json) -> Option<Json> {
+  let owner = str(decl, "owner")
+  let ret = member(decl, "ret")
+  let is_owner = |t: Json| str(t, "kind") == "Record" && str(t, "name") == owner && arg_types(t).is_empty()
+  if is_owner(ret) {
+    return Some(Json.Object([("kind", Json.Str("Unit")), ("text", Json.Str("Unit"))]))
+  }
+  let args = arg_types(ret)
+  if str(ret, "kind") == "Tuple" && args.len() == 2 && is_owner(args[0]) {
+    return Some(args[1])
+  }
+  None
 }
 
 // A type declaration as cir/1, or why it has none.
@@ -703,7 +788,7 @@ fn is_method(decl: Json) -> Bool {
 }
 
 // The cir/1 name of the fn `decl`: its own name; a method's key is `Owner.name`.
-fn func_key(decl: Json) -> Text = if is_method(decl) { str(decl, "owner") + "." + str(decl, "name") } else { str(decl, "name") }
+fn func_key(m: Model, decl: Json) -> Text = if is_method(decl) { str(decl, "owner") + "." + cir_name(m, str(decl, "qualifiedName")) } else { str(decl, "name") }
 
 // ---- the reading context of one function ------------------------------------------------
 
@@ -720,6 +805,8 @@ type Cx {
   fresh: List<Text>
   // The names the current Go block declares (the parameters for the function's own).
   scope: List<Text>
+  // The receiver of a method that returns it (cir/1's pointer receiver), else "".
+  receiver: Text
 }
 
 // Ignite's lists and maps are values; Go's slices and maps share their storage when copied.
@@ -893,7 +980,18 @@ fn val(cx: Cx, i: Int) -> Result<Expr, Text> {
     "bool" => Ok(literal(node, Type.Bool))
     "name" => name_val(cx, node)
     "field" => {
-      let x = val(cx, num(node, "receiver"))?
+      if variant_path(cx, node) {
+        return name_val(cx, node)
+      }
+      let receiver = expr_node(d, num(node, "receiver"))
+      let x = if str(receiver, "kind") == "name" && is_receiver_name(cx, str(receiver, "name")) {
+        match local_type(cx, cx.receiver) {
+          Some(t) => Expr.Var(VarExpr { name = cx.receiver, t })
+          None => return Err("the receiver " + cx.receiver + ", which is no local")
+        }
+      } else {
+        val(cx, num(node, "receiver"))?
+      }
       Ok(Expr.Field(FieldExpr { x, name = str(node, "name"), t = type_of_node(cx, node)? }))
     }
     "index" => {
@@ -945,10 +1043,30 @@ fn val(cx: Cx, i: Int) -> Result<Expr, Text> {
   }
 }
 
-// A name: a local or parameter, a constant, or an enum variant without payload.
+// Whether the field node `node` is a variant named through its enum, `E.V`.
+fn variant_path(cx: Cx, node: Json) -> Bool {
+  let receiver = expr_node(cx.d, num(node, "receiver"))
+  let t = member(node, "type")
+  str(node, "kind") == "field" && str(receiver, "kind") == "name" && str(member(receiver, "type"), "kind") == "Unit" && str(t, "kind") == "Enum" && str(t, "module") == cx.m.module && str(receiver, "name") == str(t, "name") && local_type(cx, str(receiver, "name")) == None
+}
+
+// A name: a local or parameter, a constant, or an enum variant without payload, also named
+// through its enum (`E.V`).
 fn name_val(cx: Cx, node: Json) -> Result<Expr, Text> {
   let name = str(node, "name")
   let t = member(node, "type")
+  if is_receiver_name(cx, name) && str(node, "kind") == "name" {
+    return Err("the receiver " + name + " as a value: cir/1's receiver is a pointer, which Go shares where Ignite copies")
+  }
+  if str(node, "kind") == "field" {
+    if cx.m.error && str(t, "name") == "Error" {
+      return Err("the error " + name + " outside `Err(..)`")
+    }
+    if is_variant(cx.m, str(t, "name"), name) {
+      return Ok(Expr.Const(ConstExpr { name, t = named(str(t, "name")) }))
+    }
+    return Err("the variant " + name + " of " + str(t, "name") + ": cir/1 has no expression for a union value")
+  }
   match local_type(cx, name) {
     Some(Type.Any) => return Err("the name " + name + ", bound by a statement cir/1 cannot express")
     Some(lt) => return Ok(Expr.Var(VarExpr { name, t = lt }))
@@ -1042,10 +1160,26 @@ fn fn_call(cx: Cx, qualified: Text, args: List<Expr>, t: Type) -> Result<Expr, T
       return Ok(Expr.Binop(BinopExpr { op = if qualified == "wrapping_add" { "+" } else { "-" }, x = args[0], y = args[1], t }))
     }
   }
+  if has(cx.m.consumed, qualified) && last_segment(qualified) == "value" && args.len() == 1 {
+    // `E.value(x)`, the writer's text of an enum over `string`: Go prints the value with `%s`.
+    match find_enum(cx.m, cut(qualified, 0, qualified.len() - 6)) {
+      Some(e) => if fn_decl(cx.d, e.name + ".String") != None || fn_decl(cx.d, e.name + ".Error") != None {
+        return Err("the value of the enum " + e.name + ", which has a method Go's %s calls in place of the value")
+      } else if e.under == Type.String {
+        return Ok(Expr.Intrinsic(IntrinsicExpr { name = "sprintf", args = [lit_text("%s"), args[0]], t }))
+      } else {
+        return Err("the value of the enum " + e.name + " over Int: cir/1 converts only to a named type")
+      }
+      None => {}
+    }
+  }
+  if has(cx.m.threaded, qualified) {
+    return Err("a call of " + qualified + ", which returns its receiver: cir/1's method writes it in place")
+  }
   for (q, method) in cx.m.funcs {
     if q == qualified {
       if method {
-        return Ok(Expr.Method(MethodExpr { x = args[0], name = last_segment(q), args = args.slice(1, args.len()), t }))
+        return Ok(Expr.Method(MethodExpr { x = args[0], name = cir_name(cx.m, q), args = args.slice(1, args.len()), t }))
       }
       return Ok(Expr.Call(CallExpr { name = last_segment(q), args, t }))
     }
@@ -1168,10 +1302,35 @@ fn stmts(cx: Cx, list: List<Int>, tail: Bool) -> List<Stmt> {
   out
 }
 
+// A name bound inside a method returning its receiver that is the receiver's: what the method
+// returns under that name is then not the receiver, but cir/1 would return the receiver.
+const REBOUND: Text = "a binding inside a method returning its receiver of the receiver's name "
+
+// Whether `name` is the receiver of a method returning it, bound as the receiver and not by a
+// later statement.
+fn is_receiver_name(cx: Cx, name: Text) -> Bool = cx.receiver != "" && name == cx.receiver && match local_type(cx, name) {
+  Some(Type.Ptr(_)) => true
+  _ => false
+}
+
 // One statement as cir/1 and the context after it, or why it has none.
 fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
   let d = cx.d
   let at = pos(d, node)
+  if cx.receiver != "" {
+    var names = bound_names(d, node)
+    if str(node, "kind") == "for" {
+      names.push(str(node, "name"))
+    }
+    if str(node, "kind") == "forPattern" {
+      for item in indexes(pattern_node(d, num(node, "pattern")), "items") {
+        names.push(str(pattern_node(d, item), "name"))
+      }
+    }
+    if has(names, cx.receiver) {
+      return Err(REBOUND + cx.receiver)
+    }
+  }
   match str(node, "kind") {
     "let" => {
       let name = str(node, "name")
@@ -1234,9 +1393,48 @@ fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
       let body = block(with_local(cx, name, elem), member(node, "body"), false)
       Ok(([Stmt.ForRange(ForRangeStmt { key = "_", val = name, over, body, pos = at })], cx))
     }
-    "forPattern" => match over_type(cx, num(node, "iter")) {
-      Type.Map(_) => Err(MAP_LOOP)
-      _ => Err("a loop with a pattern over something other than a map")
+    "forPattern" => {
+      let iter = expr_node(d, num(node, "iter"))
+      let callee = member(iter, "callee")
+      let marked = str(iter, "kind") == "call" && str(callee, "kind") == "fn" && str(callee, "module") == cx.m.module && str(callee, "name") == "unordered" && has(cx.m.consumed, "unordered") && indexes(iter, "args").len() == 1
+      if !marked {
+        return match over_type(cx, num(node, "iter")) {
+          Type.Map(_) => Err(MAP_LOOP)
+          _ => Err("a loop with a pattern over something other than a map")
+        }
+      }
+      let source = indexes(iter, "args")[0]
+      let (key_t, elem) = match over_type(cx, source) {
+        Type.Map(mt) => (mt.key, mt.elem)
+        _ => return Err("a loop over `unordered(..)` of something other than a map")
+      }
+      if cx.writes && holds_container(cx.m, elem, []) {
+        return Err(SHARED)
+      }
+      let p = pattern_node(d, num(node, "pattern"))
+      let parts = indexes(p, "items")
+      if str(p, "kind") != "tuple" || parts.len() != 2 {
+        return Err("a loop over a map whose pattern is not (key, value)")
+      }
+      var names: List<Text> = []
+      for q in parts {
+        let part = pattern_node(d, q)
+        match str(part, "kind") {
+          "binding" => names.push(str(part, "name"))
+          "wildcard" => names.push("_")
+          _ => return Err("a loop over a map whose pattern is not (key, value)")
+        }
+      }
+      var inner = cx
+      if names[0] != "_" {
+        inner = with_local(inner, names[0], key_t)
+      }
+      if names[1] != "_" {
+        inner = with_local(inner, names[1], elem)
+      }
+      let over = val(cx, source)?
+      let body = block(inner, member(node, "body"), false)
+      Ok(([Stmt.ForRange(ForRangeStmt { key = names[0], val = names[1], over, body, pos = at })], cx))
     }
     "expr" => {
       let e = num(node, "expr")
@@ -1378,6 +1576,11 @@ fn tail_expr(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
     "match" => Ok([switch_stmt(cx, node, true, at)?])
     "block" => Err("a block as a value: cir/1 has no block statement")
     "return" => return_stmts(cx, num(node, "value"), at)
+    "name" => if is_receiver_name(cx, str(node, "name")) && cx.results.is_empty() && cx.shape == Shape.Plain {
+      Ok([])
+    } else {
+      return_stmts(cx, e, at)
+    }
     _ => if cx.results.is_empty() && cx.shape == Shape.Plain {
       expr_stmt(cx, e, at)
     } else {
@@ -1436,6 +1639,9 @@ fn switch_stmt(cx: Cx, node: Json, tail: Bool, at: Text) -> Result<Stmt, Text> {
     } else if kind == "binding" {
       if str(scrutinee, "kind") != "name" {
         return Err("a `match` arm that binds a value other than a variable")
+      }
+      if cx.receiver != "" && str(p, "name") == cx.receiver {
+        return Err(REBOUND + cx.receiver)
       }
       if cx.writes && holds_container(cx.m, tag_type, []) {
         return Err(SHARED)
@@ -1511,7 +1717,8 @@ fn case_values(cx: Cx, p: Json, t: Type) -> Result<List<Expr>, Text> {
 
 // `return e` as cir/1. In a comma-ok function, `return m.get(k)` is a lookup that returns
 // `(zero, false)` when the key is absent, then `(v, true)`.
-fn return_stmts(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
+fn return_stmts(cx: Cx, returned_value: Int, at: Text) -> Result<List<Stmt>, Text> {
+  let e = unthread(cx, returned_value)?
   if cx.shape == Shape.CommaOk && e >= 0 {
     let node = expr_node(cx.d, e)
     if str(node, "kind") == "method" && callee_name(node) == "MapGet" {
@@ -1528,6 +1735,29 @@ fn return_stmts(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
     }
   }
   Ok([Stmt.Return(ReturnStmt { results = returned(cx, e)?, pos = at })])
+}
+
+// What a method returning its receiver `r` returns besides it: nothing for `r`, `v` for
+// `(r, v)`; -1 for nothing. Any other function's `e` as it is.
+fn unthread(cx: Cx, e: Int) -> Result<Int, Text> {
+  if cx.receiver == "" {
+    return Ok(e)
+  }
+  let is_receiver = |i: Int| i >= 0 && str(expr_node(cx.d, i), "kind") == "name" && is_receiver_name(cx, str(expr_node(cx.d, i), "name"))
+  if cx.results.is_empty() && cx.shape == Shape.Plain {
+    if is_receiver(e) {
+      return Ok(-1)
+    }
+    return Err("a method returning its receiver " + cx.receiver + " that returns something else")
+  }
+  if e >= 0 {
+    let node = expr_node(cx.d, e)
+    let parts = indexes(node, "items")
+    if str(node, "kind") == "tuple" && parts.len() == 2 && is_receiver(parts[0]) {
+      return Ok(parts[1])
+    }
+  }
+  Err("a method returning its receiver " + cx.receiver + " that returns other than (" + cx.receiver + ", value)")
 }
 
 // The values `return e` gives in cir/1: a function's several results from a tuple, a
@@ -1594,22 +1824,30 @@ fn values_of(cx: Cx, e: Int) -> Result<List<Expr>, Text> {
   Ok([returned_one(cx, e)?])
 }
 
-// The error of `Err(e)`: a sentinel of the writer's `enum Error`, or `Msg(text)` as `errorf`.
+// The error of `Err(e)`: a sentinel of the writer's `enum Error` (`S` or `Error.S`),
+// `Msg(text)` as `errorf`, or `V(v)` of an error type as the value `v` used as an error.
 fn error_val(cx: Cx, e: Int) -> Result<Expr, Text> {
   let node = expr_node(cx.d, e)
-  match str(node, "kind") {
-    "name" => if has(cx.m.sentinels, str(node, "name")) {
+  let kind = str(node, "kind")
+  let sentinel = kind == "name" || (kind == "field" && variant_path(cx, node))
+  if sentinel {
+    return if has(cx.m.sentinels, str(node, "name")) && local_type(cx, str(node, "name")) == None {
       Ok(Expr.Errvar(ErrvarExpr { name = str(node, "name"), t = Type.Error }))
     } else {
       Err("the error " + str(node, "name") + ", which is no sentinel")
     }
-    "call" => if str(member(node, "callee"), "variant") == "Msg" {
-      Ok(Expr.Intrinsic(IntrinsicExpr { name = "errorf", args = [lit_text("%s"), val(cx, indexes(node, "args")[0])?], t = Type.Error }))
-    } else {
-      Err("an error that is not a sentinel or Msg(..)")
-    }
-    _ => Err("an error that is not a sentinel or Msg(..)")
   }
+  // `V(x)` is a call, `Error.V(x)` a method node whose receiver names the enum.
+  if (kind == "call" || kind == "method") && str(member(node, "callee"), "kind") == "variant" && str(member(node, "callee"), "enum") == "Error" {
+    let variant = str(member(node, "callee"), "variant")
+    if variant == "Msg" {
+      return Ok(Expr.Intrinsic(IntrinsicExpr { name = "errorf", args = [lit_text("%s"), val(cx, indexes(node, "args")[0])?], t = Type.Error }))
+    }
+    if has(cx.m.error_types, variant) {
+      return Ok(Expr.ToError(ToErrorExpr { x = copied(cx, indexes(node, "args")[0])?, t = Type.Error }))
+    }
+  }
+  Err("an error that is not a sentinel, Msg(..) or an error type")
 }
 
 fn assign(cx: Cx, node: Json, at: Text) -> Result<Stmt, Text> {
@@ -1618,6 +1856,9 @@ fn assign(cx: Cx, node: Json, at: Text) -> Result<Stmt, Text> {
   let base_type = match local_type(cx, base) {
     Some(t) => t
     None => return Err("a write to " + base + ", which is no local")
+  }
+  if is_receiver_name(cx, base) && items(target, "fields").is_empty() {
+    return Err("an assignment to the receiver " + base + " as a whole: cir/1's receiver is a pointer, which Go would rebind where Ignite replaces the value")
   }
   var place = Expr.Var(VarExpr { name = base, t = base_type })
   var current = base_type
@@ -1628,6 +1869,10 @@ fn assign(cx: Cx, node: Json, at: Text) -> Result<Stmt, Text> {
     }
     let owner = match current {
       Type.Named(n) => n.name
+      Type.Ptr(p) => match p.elem {
+        Type.Named(n) => n.name
+        _ => return Err("a write to a field of something other than a struct")
+      }
       _ => return Err("a write to a field of something other than a struct")
     }
     let decl = match find_struct(cx.m, owner) {
@@ -1710,7 +1955,7 @@ fn read_ignite(document: Text, source: Text) -> Result<CirModule, Text> {
 fn in_module(decl: Json) -> Bool = str(decl, "kind") != "test" && !flag(decl, "testOnly")
 
 fn translate(d: Doc) -> Result<CirModule, Text> {
-  var m = Model { module = d.module, structs = [], enums = [], unions = [], refused_types = [], consts = [], funcs = [], consumed = [], error = false, sentinels = [] }
+  var m = Model { module = d.module, structs = [], enums = [], unions = [], refused_types = [], consts = [], funcs = [], consumed = [], error = false, sentinels = [], error_types = [], threaded = [] }
   for decl in d.decls {
     if !in_module(decl) {
       continue
@@ -1721,11 +1966,16 @@ fn translate(d: Doc) -> Result<CirModule, Text> {
       for v in items(decl, "variants") {
         if items(v, "payload").is_empty() {
           m.sentinels.push(str(v, "name"))
+        } else if is_error_type(d, v) {
+          m.error_types.push(str(v, "name"))
         }
       }
     }
-    if str(decl, "kind") == "fn" && is_wrapping_helper(decl) {
+    if str(decl, "kind") == "fn" && (is_wrapping_helper(decl) || is_unordered_helper(d, decl)) {
       m.consumed.push(str(decl, "qualifiedName"))
+    }
+    if str(decl, "kind") == "fn" && is_threaded(d, decl) {
+      m.threaded.push(str(decl, "qualifiedName"))
     }
   }
   // Types: refuse until no further declaration falls, so that a type naming a refused one is
@@ -1781,7 +2031,7 @@ fn translate(d: Doc) -> Result<CirModule, Text> {
     }
     match signature(m, decl) {
       Ok(_) => {
-        let key = func_key(decl)
+        let key = func_key(m, decl)
         if !has(keys, key) {
           keys.push(key)
           m.funcs.push((str(decl, "qualifiedName"), is_method(decl)))
@@ -1847,7 +2097,7 @@ fn translate(d: Doc) -> Result<CirModule, Text> {
         if has(m.consumed, qualified) {
           continue
         }
-        let key = func_key(decl)
+        let key = func_key(m, decl)
         if has(taken, key) {
           refusals.push(Refusal { pos = at, what = qualified, reason = "a second function named " + key + " in cir/1" })
           continue
@@ -1913,9 +2163,22 @@ fn signature(m: Model, decl: Json) -> Result<(Option<Param>, List<Param>, List<T
     }
     params.push(Param { name = str(p, "name"), t })
   }
-  let (results, shape, values) = match results_of(m, member(decl, "ret")) {
+  let threaded = has(m.threaded, str(decl, "qualifiedName"))
+  let ret = if threaded {
+    match thread_ret(decl) {
+      Some(r) => r
+      None => member(decl, "ret")
+    }
+  } else {
+    member(decl, "ret")
+  }
+  let (results, shape, values) = match results_of(m, ret) {
     Ok(r) => r
     Err(reason) => return Err("result: " + reason)
+  }
+  if threaded {
+    let r = params[0]
+    return Ok((Some(Param { name = r.name, t = Type.Ptr(PtrType { elem = r.t }) }), params.slice(1, params.len()), results, shape, values))
   }
   if is_method(decl) {
     return Ok((Some(params[0]), params.slice(1, params.len()), results, shape, values))
@@ -1949,9 +2212,19 @@ fn func(d: Doc, m: Model, decl: Json) -> Result<Func, Text> {
     locals.push((p.name, p.t))
   }
   let scope = locals.map(|l| l.0)
-  let cx = Cx { d, m, locals, shape, results, values, writes = writes_in_place(d, decl), fresh = [], scope }
-  let body = stmts(cx, indexes(member(decl, "body"), "stmts"), true)
-  Ok(Func { name = str(decl, "name"), exported = true, recv, params, results, body, doc = "", pos = pos(d, decl) })
+  var list = indexes(member(decl, "body"), "stmts")
+  var receiver = ""
+  var fresh: List<Text> = []
+  if has(m.threaded, str(decl, "qualifiedName")) {
+    // `var r = r` is the writer's copy of the receiver; cir/1's receiver is the pointer itself,
+    // whose writes reach the caller as the returned receiver does.
+    receiver = str(items(decl, "params")[0], "name")
+    fresh.push(receiver)
+    list = list.slice(1, list.len())
+  }
+  let cx = Cx { d, m, locals, shape, results, values, writes = writes_in_place(d, decl), fresh, scope, receiver }
+  let body = stmts(cx, list, true)
+  Ok(Func { name = cir_name(m, str(decl, "qualifiedName")), exported = true, recv, params, results, body, doc = "", pos = pos(d, decl) })
 }
 
 // ---- tests -------------------------------------------------------------------------------
@@ -2007,6 +2280,10 @@ test fn func_json(m: CirModule, key: Text) -> Text {
     let k = match f.recv {
       Some(r) => match r.t {
         Type.Named(n) => n.name + "." + f.name
+        Type.Ptr(p) => match p.elem {
+          Type.Named(n) => n.name + "." + f.name
+          _ => f.name
+        }
         _ => f.name
       }
       None => f.name
@@ -2163,6 +2440,45 @@ test "the same document gives the same bytes" {
 
 test "a document of another format is refused" {
   assert read_of(r#"{"formatVersion":"ignite-typed/9"}"#, "").format == "unread: the compiler's document is `ignite-typed/9`, this reader reads `ignite-typed/0.1`"
+}
+
+test "the writer's forms read back: a method returning its receiver, error types, qualified variants, E.value, unordered" {
+  let m = read_of(WRITTEN_DOC, WRITTEN_SRC)
+  assert m.refusals.map(|r| r.pos + " " + r.reason) == []
+  assert m.layout == ["type:Mode", "type:Bad", "func:Bad.Error", "type:Box", "func:Box.add", "func:Box.clear", "func:Box.on", "error:Empty"]
+  assert m.errors.map(|e| encode(ErrorVar.to_json(e))) == [r#"{"name":"Empty","message":"empty","pos":"written.ignite:56"}"#]
+  let mode = named_of("Mode")
+  let bad = named_of("Bad")
+  let boxed = named_of("Box")
+  let shown = r#"{"k":"intrinsic","name":"sprintf","args":["# + lit_of("\"%s\"", STR) + "," + field_of(var_of("e", bad), "mode", mode) + r#"],"t":"# + STR + r#"}"#
+  assert func_json(m, "Bad.Error") == r#"{"name":"Error","exported":true,"recv":{"name":"e","t":"# + bad + r#"},"params":[],"results":["# + STR + r#"],"body":["# + ret_of(binop_of("+", lit_of("\"bad \"", STR), shown, STR), "written.ignite:18") + r#"],"pos":"written.ignite:17"}"#
+  let ptr = r#"{"k":"ptr","elem":"# + boxed + r#"}"#
+  let b = var_of("b", ptr)
+  let count = field_of(b, "count", INT)
+  let zero = r#"{"k":"zero","t":"# + INT + r#"}"#
+  let constant = |name: Text| r#"{"k":"const","name":""# + name + r#"","t":"# + mode + r#"}"#
+  let wrong = r#"{"k":"to_error","x":{"k":"struct","name":"Bad","fields":[{"name":"mode","value":"# + constant("Off") + r#"}],"t":"# + bad + r#"},"t":"# + ERR_T + r#"}"#
+  let empty = r#"{"k":"errvar","name":"Empty","t":"# + ERR_T + r#"}"#
+  let items_t = r#"{"k":"map","key":"# + STR + r#","elem":"# + mode + r#"}"#
+  let entry = r#"{"k":"index","x":"# + field_of(b, "items", items_t) + r#","index":"# + var_of("key", STR) + r#","t":"# + mode + r#"}"#
+  let add = [
+    r#"{"k":"if","cond":"# + binop_of("<", count, lit_of("0", INT), BOOL_T) + r#","then":["# + ret_of(zero + "," + wrong, "written.ignite:29") + r#"],"pos":"written.ignite:28"}"#,
+    r#"{"k":"if","cond":"# + binop_of("==", var_of("key", STR), lit_of("\"\"", STR), BOOL_T) + r#","then":["# + ret_of(zero + "," + empty, "written.ignite:32") + r#"],"pos":"written.ignite:31"}"#,
+    r#"{"k":"incr","x":"# + count + r#","pos":"written.ignite:34"}"#,
+    assign_of(entry, constant("On"), "written.ignite:35"),
+    ret_of(count + r#",{"k":"nil","t":"# + ERR_T + r#"}"#, "written.ignite:36")
+  ]
+  assert func_json(m, "Box.add") == r#"{"name":"add","exported":true,"recv":{"name":"b","t":"# + ptr + r#"},"params":[{"name":"key","t":"# + STR + r#"}],"results":["# + INT + "," + ERR_T + r#"],"body":["# + add.join(",") + r#"],"pos":"written.ignite:26"}"#
+  assert func_json(m, "Box.clear") == r#"{"name":"clear","exported":true,"recv":{"name":"b","t":"# + ptr + r#"},"params":[],"results":[],"body":["# + assign_of(count, lit_of("0", INT), "written.ignite:41") + r#"],"pos":"written.ignite:39"}"#
+  let list = r#"{"k":"slice","elem":"# + STR + r#"}"#
+  let out = var_of("out", list)
+  let push = assign_of(out, r#"{"k":"intrinsic","name":"append","args":["# + out + "," + var_of("k", STR) + r#"],"t":"# + list + r#"}"#, "written.ignite:49")
+  let found = r#"{"k":"if","cond":"# + binop_of("==", var_of("m", mode), constant("On"), BOOL_T) + r#","then":["# + push + r#"],"pos":"written.ignite:48"}"#
+  assert body_json(m, "on") == [
+    let_of("out", r#"{"k":"make","t":"# + list + r#"}"#, "written.ignite:46"),
+    r#"{"k":"for_range","key":"k","val":"m","over":"# + field_of(var_of("b", boxed), "items", items_t) + r#","body":["# + found + r#"],"pos":"written.ignite:47"}"#,
+    ret_of(out, "written.ignite:52")
+  ]
 }
 
 test const TYPES_SRC: Text = r##"package snip.types
@@ -2335,3 +2651,78 @@ fn twice() -> Int = TWICE
 "##
 
 test const FOREIGN_DOC: Text = r##"{"decls":[{"body":{"span":{"column":25,"end":99,"endColumn":2,"endLine":9,"file":0,"line":3,"start":46},"stmts":[0,1,3]},"bounds":[],"effectful":false,"kind":"fn","name":"count","owner":null,"params":[{"name":"n","span":{"column":10,"end":37,"endColumn":16,"endLine":3,"file":0,"line":3,"start":31},"type":{"kind":"Int","text":"Int"}}],"qualifiedName":"count","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":99,"endColumn":2,"endLine":9,"file":0,"line":3,"start":22},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":33,"end":138,"endColumn":38,"endLine":11,"file":0,"line":11,"start":133},"stmts":[4]},"bounds":[],"effectful":false,"kind":"fn","name":"first","owner":null,"params":[{"name":"xs","span":{"column":13,"end":124,"endColumn":24,"endLine":11,"file":0,"line":11,"start":113},"type":{"args":[{"kind":"Param","name":"T","text":"T"}],"kind":"List","text":"List<T>"}}],"qualifiedName":"first","requires":null,"ret":{"kind":"Param","name":"T","text":"T"},"satisfies":[],"span":{"column":1,"end":138,"endColumn":38,"endLine":11,"file":0,"line":11,"start":101},"testOnly":false,"typeParams":["T"]},{"body":{"span":{"column":21,"end":186,"endColumn":2,"endLine":15,"file":0,"line":13,"start":160},"stmts":[5]},"kind":"test","name":"count counts","span":{"column":1,"end":186,"endColumn":2,"endLine":15,"file":0,"line":13,"start":140},"verifies":[]},{"kind":"const","name":"TWICE","span":{"column":1,"end":212,"endColumn":25,"endLine":17,"file":0,"line":17,"start":188},"testOnly":false,"type":{"kind":"Int","text":"Int"},"value":16},{"body":{"span":{"column":21,"end":239,"endColumn":26,"endLine":19,"file":0,"line":19,"start":234},"stmts":[6]},"bounds":[],"effectful":false,"kind":"fn","name":"twice","owner":null,"params":[],"qualifiedName":"twice","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":239,"endColumn":26,"endLine":19,"file":0,"line":19,"start":214},"testOnly":false,"typeParams":[]}],"exprs":[{"kind":"int","span":{"column":11,"end":59,"endColumn":12,"endLine":4,"file":0,"line":4,"start":58},"type":{"kind":"Int","text":"Int"},"value":0},{"kind":"binary","left":2,"op":"<","right":3,"span":{"column":9,"end":73,"endColumn":14,"endLine":5,"file":0,"line":5,"start":68},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"i","span":{"column":9,"end":69,"endColumn":10,"endLine":5,"file":0,"line":5,"start":68},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"n","span":{"column":13,"end":73,"endColumn":14,"endLine":5,"file":0,"line":5,"start":72},"type":{"kind":"Int","text":"Int"}},{"kind":"binary","left":5,"op":"+","right":6,"span":{"column":9,"end":89,"endColumn":14,"endLine":6,"file":0,"line":6,"start":84},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"i","span":{"column":9,"end":85,"endColumn":10,"endLine":6,"file":0,"line":6,"start":84},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":13,"end":89,"endColumn":14,"endLine":6,"file":0,"line":6,"start":88},"type":{"kind":"Int","text":"Int"},"value":1},{"kind":"name","name":"i","span":{"column":3,"end":97,"endColumn":4,"endLine":8,"file":0,"line":8,"start":96},"type":{"kind":"Int","text":"Int"}},{"index":10,"kind":"index","receiver":9,"span":{"column":33,"end":138,"endColumn":38,"endLine":11,"file":0,"line":11,"start":133},"type":{"kind":"Param","name":"T","text":"T"}},{"kind":"name","name":"xs","span":{"column":33,"end":135,"endColumn":35,"endLine":11,"file":0,"line":11,"start":133},"type":{"args":[{"kind":"Param","name":"T","text":"T"}],"kind":"List","text":"List<T>"}},{"kind":"int","span":{"column":36,"end":137,"endColumn":37,"endLine":11,"file":0,"line":11,"start":136},"type":{"kind":"Int","text":"Int"},"value":0},{"kind":"binary","left":12,"op":"==","right":15,"span":{"column":10,"end":184,"endColumn":23,"endLine":14,"file":0,"line":14,"start":171},"type":{"kind":"Bool","text":"Bool"}},{"args":[14],"callee":{"kind":"fn","module":"snip.foreign","name":"count"},"function":13,"kind":"call","namedArgs":null,"span":{"column":10,"end":179,"endColumn":18,"endLine":14,"file":0,"line":14,"start":171},"type":{"kind":"Int","text":"Int"},"ufcs":false},{"kind":"name","name":"count","span":{"column":10,"end":176,"endColumn":15,"endLine":14,"file":0,"line":14,"start":171},"type":{"kind":"Fn","params":[{"kind":"Int","text":"Int"}],"requires":null,"ret":{"kind":"Int","text":"Int"},"text":"fn(Int) -> Int"}},{"kind":"int","span":{"column":16,"end":178,"endColumn":17,"endLine":14,"file":0,"line":14,"start":177},"type":{"kind":"Int","text":"Int"},"value":2},{"kind":"int","span":{"column":22,"end":184,"endColumn":23,"endLine":14,"file":0,"line":14,"start":183},"type":{"kind":"Int","text":"Int"},"value":2},{"kind":"binary","left":17,"op":"*","right":18,"span":{"column":20,"end":212,"endColumn":25,"endLine":17,"file":0,"line":17,"start":207},"type":{"kind":"Int","text":"Int"}},{"kind":"int","span":{"column":20,"end":208,"endColumn":21,"endLine":17,"file":0,"line":17,"start":207},"type":{"kind":"Int","text":"Int"},"value":2},{"kind":"int","span":{"column":24,"end":212,"endColumn":25,"endLine":17,"file":0,"line":17,"start":211},"type":{"kind":"Int","text":"Int"},"value":2},{"kind":"name","name":"TWICE","span":{"column":21,"end":239,"endColumn":26,"endLine":19,"file":0,"line":19,"start":234},"type":{"kind":"Int","text":"Int"}}],"files":["foreign.ignite"],"formatVersion":"ignite-typed/0.1","imports":[],"module":"snip.foreign","package":"snip.foreign","patterns":[],"stmts":[{"bindingType":{"kind":"Int","text":"Int"},"declaredType":null,"kind":"let","mutable":true,"name":"i","span":{"column":3,"end":59,"endColumn":12,"endLine":4,"file":0,"line":4,"start":50},"value":0},{"body":{"span":{"column":15,"end":93,"endColumn":4,"endLine":7,"file":0,"line":5,"start":74},"stmts":[2]},"cond":1,"kind":"while","span":{"column":3,"end":93,"endColumn":4,"endLine":7,"file":0,"line":5,"start":62}},{"kind":"assign","span":{"column":5,"end":89,"endColumn":14,"endLine":6,"file":0,"line":6,"start":80},"target":{"base":"i","fields":[],"ownerType":null,"span":{"column":5,"end":81,"endColumn":6,"endLine":6,"file":0,"line":6,"start":80}},"value":4},{"expr":7,"kind":"expr","span":{"column":3,"end":97,"endColumn":4,"endLine":8,"file":0,"line":8,"start":96}},{"expr":8,"kind":"expr","span":{"column":33,"end":138,"endColumn":38,"endLine":11,"file":0,"line":11,"start":133}},{"cond":11,"kind":"assert","message":null,"span":{"column":3,"end":184,"endColumn":23,"endLine":14,"file":0,"line":14,"start":164}},{"expr":19,"kind":"expr","span":{"column":21,"end":239,"endColumn":26,"endLine":19,"file":0,"line":19,"start":234}}]}"##
+
+test const WRITTEN_SRC: Text = r##"package snip.written
+
+enum Mode {
+  On
+  Off
+}
+
+fn Mode.value(v: Mode) -> Text = match v {
+  Mode.On => "on"
+  Mode.Off => "off"
+}
+
+type Bad {
+  mode: Mode
+}
+
+fn Bad.error(e: Bad) -> Text {
+  return "bad " + Mode.value(e.mode)
+}
+
+type Box {
+  items: Map<Text, Mode>
+  count: Int
+}
+
+fn Box.add(b: Box, key: Text) -> (Box, Result<Int, Error>) {
+  var b = b
+  if b.count < 0 {
+    return (b, Err(Error.Bad(Bad { mode = Mode.Off })))
+  }
+  if key == "" {
+    return (b, Err(Error.Empty))
+  }
+  b.count = wrapping_add(b.count, 1)
+  b.items.put(key, Mode.On)
+  return (b, Ok(b.count))
+}
+
+fn Box.clear(b: Box) -> Box {
+  var b = b
+  b.count = 0
+  b
+}
+
+fn Box.on(b: Box) -> List<Text> {
+  var out: List<Text> = []
+  for (k, m) in unordered(b.items) {
+    if m == Mode.On {
+      out.push(k)
+    }
+  }
+  return out
+}
+
+enum Error {
+  Empty
+  Bad(Bad)
+  Msg(Text)
+}
+
+fn Error.text(e: Error) -> Text = match e {
+  Error.Empty => "empty"
+  Error.Bad(x) => Bad.error(x)
+  Error.Msg(text) => text
+}
+
+fn wrapping_add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+fn unordered<T>(m: T) -> T = m
+"##
+
+test const WRITTEN_DOC: Text = r##"{"decls":[{"kind":"enum","name":"Mode","span":{"column":1,"end":46,"endColumn":2,"endLine":6,"file":0,"line":3,"start":22},"testOnly":false,"typeParams":[],"variants":[{"name":"On","payload":[],"span":{"column":3,"end":38,"endColumn":5,"endLine":4,"file":0,"line":4,"start":36}},{"name":"Off","payload":[],"span":{"column":3,"end":44,"endColumn":6,"endLine":5,"file":0,"line":5,"start":41}}]},{"body":{"span":{"column":34,"end":130,"endColumn":2,"endLine":11,"file":0,"line":8,"start":81},"stmts":[0]},"bounds":[],"effectful":false,"kind":"fn","name":"value","owner":"Mode","params":[{"name":"v","span":{"column":15,"end":69,"endColumn":22,"endLine":8,"file":0,"line":8,"start":62},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}}],"qualifiedName":"Mode.value","requires":null,"ret":{"kind":"Text","text":"Text"},"satisfies":[],"span":{"column":1,"end":130,"endColumn":2,"endLine":11,"file":0,"line":8,"start":48},"testOnly":false,"typeParams":[]},{"fields":[{"default":null,"name":"mode","satisfies":[],"span":{"column":3,"end":155,"endColumn":13,"endLine":14,"file":0,"line":14,"start":145},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}}],"kind":"record","name":"Bad","satisfies":[],"span":{"column":1,"end":157,"endColumn":2,"endLine":15,"file":0,"line":13,"start":132},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":30,"end":228,"endColumn":2,"endLine":19,"file":0,"line":17,"start":188},"stmts":[1]},"bounds":[],"effectful":false,"kind":"fn","name":"error","owner":"Bad","params":[{"name":"e","span":{"column":14,"end":178,"endColumn":20,"endLine":17,"file":0,"line":17,"start":172},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Bad","text":"Bad"}}],"qualifiedName":"Bad.error","requires":null,"ret":{"kind":"Text","text":"Text"},"satisfies":[],"span":{"column":1,"end":228,"endColumn":2,"endLine":19,"file":0,"line":17,"start":159},"testOnly":false,"typeParams":[]},{"fields":[{"default":null,"name":"items","satisfies":[],"span":{"column":3,"end":265,"endColumn":25,"endLine":22,"file":0,"line":22,"start":243},"type":{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"}},{"default":null,"name":"count","satisfies":[],"span":{"column":3,"end":278,"endColumn":13,"endLine":23,"file":0,"line":23,"start":268},"type":{"kind":"Int","text":"Int"}}],"kind":"record","name":"Box","satisfies":[],"span":{"column":1,"end":280,"endColumn":2,"endLine":24,"file":0,"line":21,"start":230},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":60,"end":580,"endColumn":2,"endLine":37,"file":0,"line":26,"start":341},"stmts":[2,3,5,7,8,9]},"bounds":[],"effectful":false,"kind":"fn","name":"add","owner":"Box","params":[{"name":"b","span":{"column":12,"end":299,"endColumn":18,"endLine":26,"file":0,"line":26,"start":293},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"name":"key","span":{"column":20,"end":310,"endColumn":29,"endLine":26,"file":0,"line":26,"start":301},"type":{"kind":"Text","text":"Text"}}],"qualifiedName":"Box.add","requires":null,"ret":{"args":[{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"}],"kind":"Tuple","text":"(Box, Result<Int, Error>)"},"satisfies":[],"span":{"column":1,"end":580,"endColumn":2,"endLine":37,"file":0,"line":26,"start":282},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":29,"end":643,"endColumn":2,"endLine":43,"file":0,"line":39,"start":610},"stmts":[10,11,12]},"bounds":[],"effectful":false,"kind":"fn","name":"clear","owner":"Box","params":[{"name":"b","span":{"column":14,"end":601,"endColumn":20,"endLine":39,"file":0,"line":39,"start":595},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}}],"qualifiedName":"Box.clear","requires":null,"ret":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},"satisfies":[],"span":{"column":1,"end":643,"endColumn":2,"endLine":43,"file":0,"line":39,"start":582},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":33,"end":807,"endColumn":2,"endLine":53,"file":0,"line":45,"start":677},"stmts":[13,14,17]},"bounds":[],"effectful":false,"kind":"fn","name":"on","owner":"Box","params":[{"name":"b","span":{"column":11,"end":661,"endColumn":17,"endLine":45,"file":0,"line":45,"start":655},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}}],"qualifiedName":"Box.on","requires":null,"ret":{"args":[{"kind":"Text","text":"Text"}],"kind":"List","text":"List<Text>"},"satisfies":[],"span":{"column":1,"end":807,"endColumn":2,"endLine":53,"file":0,"line":45,"start":645},"testOnly":false,"typeParams":[]},{"kind":"enum","name":"Error","span":{"column":1,"end":854,"endColumn":2,"endLine":59,"file":0,"line":55,"start":809},"testOnly":false,"typeParams":[],"variants":[{"name":"Empty","payload":[],"span":{"column":3,"end":829,"endColumn":8,"endLine":56,"file":0,"line":56,"start":824}},{"name":"Bad","payload":[{"args":[],"kind":"Record","module":"snip.written","name":"Bad","text":"Bad"}],"span":{"column":3,"end":840,"endColumn":11,"endLine":57,"file":0,"line":57,"start":832}},{"name":"Msg","payload":[{"kind":"Text","text":"Text"}],"span":{"column":3,"end":852,"endColumn":12,"endLine":58,"file":0,"line":58,"start":843}}]},{"body":{"span":{"column":35,"end":983,"endColumn":2,"endLine":65,"file":0,"line":61,"start":890},"stmts":[18]},"bounds":[],"effectful":false,"kind":"fn","name":"text","owner":"Error","params":[{"name":"e","span":{"column":15,"end":878,"endColumn":23,"endLine":61,"file":0,"line":61,"start":870},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}}],"qualifiedName":"Error.text","requires":null,"ret":{"kind":"Text","text":"Text"},"satisfies":[],"span":{"column":1,"end":983,"endColumn":2,"endLine":65,"file":0,"line":61,"start":856},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":40,"end":1035,"endColumn":2,"endLine":69,"file":0,"line":67,"start":1024},"stmts":[19]},"bounds":[],"effectful":false,"kind":"fn","name":"wrapping_add","owner":null,"params":[{"name":"a","span":{"column":17,"end":1007,"endColumn":23,"endLine":67,"file":0,"line":67,"start":1001},"type":{"kind":"Int","text":"Int"}},{"name":"b","span":{"column":25,"end":1015,"endColumn":31,"endLine":67,"file":0,"line":67,"start":1009},"type":{"kind":"Int","text":"Int"}}],"qualifiedName":"wrapping_add","requires":null,"ret":{"kind":"Int","text":"Int"},"satisfies":[],"span":{"column":1,"end":1035,"endColumn":2,"endLine":69,"file":0,"line":67,"start":985},"testOnly":false,"typeParams":[]},{"body":{"span":{"column":30,"end":1067,"endColumn":31,"endLine":71,"file":0,"line":71,"start":1066},"stmts":[20]},"bounds":[],"effectful":false,"kind":"fn","name":"unordered","owner":null,"params":[{"name":"m","span":{"column":17,"end":1057,"endColumn":21,"endLine":71,"file":0,"line":71,"start":1053},"type":{"kind":"Param","name":"T","text":"T"}}],"qualifiedName":"unordered","requires":null,"ret":{"kind":"Param","name":"T","text":"T"},"satisfies":[],"span":{"column":1,"end":1067,"endColumn":31,"endLine":71,"file":0,"line":71,"start":1037},"testOnly":false,"typeParams":["T"]}],"exprs":[{"arms":[{"body":2,"pattern":0,"span":{"column":3,"end":108,"endColumn":18,"endLine":9,"file":0,"line":9,"start":93}},{"body":3,"pattern":1,"span":{"column":3,"end":128,"endColumn":20,"endLine":10,"file":0,"line":10,"start":111}}],"kind":"match","scrutinee":1,"span":{"column":34,"end":130,"endColumn":2,"endLine":11,"file":0,"line":8,"start":81},"type":{"kind":"Text","text":"Text"}},{"kind":"name","name":"v","span":{"column":40,"end":88,"endColumn":41,"endLine":8,"file":0,"line":8,"start":87},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}},{"kind":"str","span":{"column":14,"end":108,"endColumn":18,"endLine":9,"file":0,"line":9,"start":104},"type":{"kind":"Text","text":"Text"},"value":"on"},{"kind":"str","span":{"column":15,"end":128,"endColumn":20,"endLine":10,"file":0,"line":10,"start":123},"type":{"kind":"Text","text":"Text"},"value":"off"},{"kind":"binary","left":5,"op":"+","right":6,"span":{"column":10,"end":226,"endColumn":37,"endLine":18,"file":0,"line":18,"start":199},"type":{"kind":"Text","text":"Text"}},{"kind":"str","span":{"column":10,"end":205,"endColumn":16,"endLine":18,"file":0,"line":18,"start":199},"type":{"kind":"Text","text":"Text"},"value":"bad "},{"args":[8],"callee":{"kind":"fn","module":"snip.written","name":"Mode.value"},"kind":"method","name":"value","namedArgs":null,"receiver":7,"span":{"column":19,"end":226,"endColumn":37,"endLine":18,"file":0,"line":18,"start":208},"type":{"kind":"Text","text":"Text"},"ufcs":true},{"kind":"name","name":"Mode","span":{"column":19,"end":212,"endColumn":23,"endLine":18,"file":0,"line":18,"start":208},"type":{"kind":"Unit","text":"Unit"}},{"kind":"field","name":"mode","receiver":9,"span":{"column":30,"end":225,"endColumn":36,"endLine":18,"file":0,"line":18,"start":219},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}},{"kind":"name","name":"e","span":{"column":30,"end":220,"endColumn":31,"endLine":18,"file":0,"line":18,"start":219},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Bad","text":"Bad"}},{"kind":"name","name":"b","span":{"column":11,"end":354,"endColumn":12,"endLine":27,"file":0,"line":27,"start":353},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"cond":12,"else":null,"kind":"if","span":{"column":3,"end":433,"endColumn":4,"endLine":30,"file":0,"line":28,"start":357},"then":{"span":{"column":18,"end":433,"endColumn":4,"endLine":30,"file":0,"line":28,"start":372},"stmts":[4]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":13,"op":"<","right":15,"span":{"column":6,"end":371,"endColumn":17,"endLine":28,"file":0,"line":28,"start":360},"type":{"kind":"Bool","text":"Bool"}},{"kind":"field","name":"count","receiver":14,"span":{"column":6,"end":367,"endColumn":13,"endLine":28,"file":0,"line":28,"start":360},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"b","span":{"column":6,"end":361,"endColumn":7,"endLine":28,"file":0,"line":28,"start":360},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"kind":"int","span":{"column":16,"end":371,"endColumn":17,"endLine":28,"file":0,"line":28,"start":370},"type":{"kind":"Int","text":"Int"},"value":0},{"items":[17,18],"kind":"tuple","span":{"column":12,"end":429,"endColumn":56,"endLine":29,"file":0,"line":29,"start":385},"type":{"args":[{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"}],"kind":"Tuple","text":"(Box, Result<Int, Error>)"}},{"kind":"name","name":"b","span":{"column":13,"end":387,"endColumn":14,"endLine":29,"file":0,"line":29,"start":386},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"args":[20],"callee":{"enum":"Result","index":1,"kind":"variant","module":"","variant":null},"function":19,"kind":"call","namedArgs":null,"span":{"column":16,"end":428,"endColumn":55,"endLine":29,"file":0,"line":29,"start":389},"type":{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"},"ufcs":false},{"kind":"name","name":"Err","span":{"column":16,"end":392,"endColumn":19,"endLine":29,"file":0,"line":29,"start":389},"type":{"kind":"Fn","params":[{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"requires":null,"ret":{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"},"text":"fn(Error) -> Result<Int, Error>"}},{"args":[22],"callee":{"enum":"Error","index":1,"kind":"variant","module":"snip.written","variant":"Bad"},"kind":"method","name":"Bad","namedArgs":null,"receiver":21,"span":{"column":20,"end":427,"endColumn":54,"endLine":29,"file":0,"line":29,"start":393},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"},"ufcs":false},{"kind":"name","name":"Error","span":{"column":20,"end":398,"endColumn":25,"endLine":29,"file":0,"line":29,"start":393},"type":{"kind":"Unit","text":"Unit"}},{"fields":[{"name":"mode","span":{"column":36,"end":424,"endColumn":51,"endLine":29,"file":0,"line":29,"start":409},"value":23}],"kind":"record","name":"Bad","span":{"column":30,"end":426,"endColumn":53,"endLine":29,"file":0,"line":29,"start":403},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Bad","text":"Bad"}},{"kind":"field","name":"Off","receiver":24,"span":{"column":43,"end":424,"endColumn":51,"endLine":29,"file":0,"line":29,"start":416},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}},{"kind":"name","name":"Mode","span":{"column":43,"end":420,"endColumn":47,"endLine":29,"file":0,"line":29,"start":416},"type":{"kind":"Unit","text":"Unit"}},{"cond":26,"else":null,"kind":"if","span":{"column":3,"end":487,"endColumn":4,"endLine":33,"file":0,"line":31,"start":436},"then":{"span":{"column":16,"end":487,"endColumn":4,"endLine":33,"file":0,"line":31,"start":449},"stmts":[6]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":27,"op":"==","right":28,"span":{"column":6,"end":448,"endColumn":15,"endLine":31,"file":0,"line":31,"start":439},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"key","span":{"column":6,"end":442,"endColumn":9,"endLine":31,"file":0,"line":31,"start":439},"type":{"kind":"Text","text":"Text"}},{"kind":"str","span":{"column":13,"end":448,"endColumn":15,"endLine":31,"file":0,"line":31,"start":446},"type":{"kind":"Text","text":"Text"},"value":""},{"items":[30,31],"kind":"tuple","span":{"column":12,"end":483,"endColumn":33,"endLine":32,"file":0,"line":32,"start":462},"type":{"args":[{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"}],"kind":"Tuple","text":"(Box, Result<Int, Error>)"}},{"kind":"name","name":"b","span":{"column":13,"end":464,"endColumn":14,"endLine":32,"file":0,"line":32,"start":463},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"args":[33],"callee":{"enum":"Result","index":1,"kind":"variant","module":"","variant":null},"function":32,"kind":"call","namedArgs":null,"span":{"column":16,"end":482,"endColumn":32,"endLine":32,"file":0,"line":32,"start":466},"type":{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"},"ufcs":false},{"kind":"name","name":"Err","span":{"column":16,"end":469,"endColumn":19,"endLine":32,"file":0,"line":32,"start":466},"type":{"kind":"Fn","params":[{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"requires":null,"ret":{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"},"text":"fn(Error) -> Result<Int, Error>"}},{"kind":"field","name":"Empty","receiver":34,"span":{"column":20,"end":481,"endColumn":31,"endLine":32,"file":0,"line":32,"start":470},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}},{"kind":"name","name":"Error","span":{"column":20,"end":475,"endColumn":25,"endLine":32,"file":0,"line":32,"start":470},"type":{"kind":"Unit","text":"Unit"}},{"args":[37,39],"callee":{"kind":"fn","module":"snip.written","name":"wrapping_add"},"function":36,"kind":"call","namedArgs":null,"span":{"column":13,"end":524,"endColumn":37,"endLine":34,"file":0,"line":34,"start":500},"type":{"kind":"Int","text":"Int"},"ufcs":false},{"kind":"name","name":"wrapping_add","span":{"column":13,"end":512,"endColumn":25,"endLine":34,"file":0,"line":34,"start":500},"type":{"kind":"Fn","params":[{"kind":"Int","text":"Int"},{"kind":"Int","text":"Int"}],"requires":null,"ret":{"kind":"Int","text":"Int"},"text":"fn(Int, Int) -> Int"}},{"kind":"field","name":"count","receiver":38,"span":{"column":26,"end":520,"endColumn":33,"endLine":34,"file":0,"line":34,"start":513},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"b","span":{"column":26,"end":514,"endColumn":27,"endLine":34,"file":0,"line":34,"start":513},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"kind":"int","span":{"column":35,"end":523,"endColumn":36,"endLine":34,"file":0,"line":34,"start":522},"type":{"kind":"Int","text":"Int"},"value":1},{"args":[43,44],"callee":{"kind":"builtin","name":"MapPut"},"kind":"method","name":"put","namedArgs":null,"receiver":41,"span":{"column":3,"end":552,"endColumn":28,"endLine":35,"file":0,"line":35,"start":527},"type":{"kind":"Unit","text":"Unit"},"ufcs":false},{"kind":"field","name":"items","receiver":42,"span":{"column":3,"end":534,"endColumn":10,"endLine":35,"file":0,"line":35,"start":527},"type":{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"}},{"kind":"name","name":"b","span":{"column":3,"end":528,"endColumn":4,"endLine":35,"file":0,"line":35,"start":527},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"kind":"name","name":"key","span":{"column":15,"end":542,"endColumn":18,"endLine":35,"file":0,"line":35,"start":539},"type":{"kind":"Text","text":"Text"}},{"kind":"field","name":"On","receiver":45,"span":{"column":20,"end":551,"endColumn":27,"endLine":35,"file":0,"line":35,"start":544},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}},{"kind":"name","name":"Mode","span":{"column":20,"end":548,"endColumn":24,"endLine":35,"file":0,"line":35,"start":544},"type":{"kind":"Unit","text":"Unit"}},{"items":[47,48],"kind":"tuple","span":{"column":10,"end":578,"endColumn":26,"endLine":36,"file":0,"line":36,"start":562},"type":{"args":[{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"}],"kind":"Tuple","text":"(Box, Result<Int, Error>)"}},{"kind":"name","name":"b","span":{"column":11,"end":564,"endColumn":12,"endLine":36,"file":0,"line":36,"start":563},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"args":[50],"callee":{"enum":"Result","index":0,"kind":"variant","module":"","variant":null},"function":49,"kind":"call","namedArgs":null,"span":{"column":14,"end":577,"endColumn":25,"endLine":36,"file":0,"line":36,"start":566},"type":{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"},"ufcs":false},{"kind":"name","name":"Ok","span":{"column":14,"end":568,"endColumn":16,"endLine":36,"file":0,"line":36,"start":566},"type":{"kind":"Fn","params":[{"kind":"Int","text":"Int"}],"requires":null,"ret":{"args":[{"kind":"Int","text":"Int"},{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}],"kind":"Result","text":"Result<Int, Error>"},"text":"fn(Int) -> Result<Int, Error>"}},{"kind":"field","name":"count","receiver":51,"span":{"column":17,"end":576,"endColumn":24,"endLine":36,"file":0,"line":36,"start":569},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"b","span":{"column":17,"end":570,"endColumn":18,"endLine":36,"file":0,"line":36,"start":569},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"kind":"name","name":"b","span":{"column":11,"end":623,"endColumn":12,"endLine":40,"file":0,"line":40,"start":622},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"kind":"int","span":{"column":13,"end":637,"endColumn":14,"endLine":41,"file":0,"line":41,"start":636},"type":{"kind":"Int","text":"Int"},"value":0},{"kind":"name","name":"b","span":{"column":3,"end":641,"endColumn":4,"endLine":42,"file":0,"line":42,"start":640},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"items":[],"kind":"list","span":{"column":25,"end":705,"endColumn":27,"endLine":46,"file":0,"line":46,"start":703},"type":{"args":[{"kind":"Text","text":"Text"}],"kind":"List","text":"List<Text>"}},{"args":[58],"callee":{"kind":"fn","module":"snip.written","name":"unordered"},"function":57,"kind":"call","namedArgs":null,"span":{"column":17,"end":740,"endColumn":35,"endLine":47,"file":0,"line":47,"start":722},"type":{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"},"typeArgs":[{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"}],"ufcs":false},{"kind":"name","name":"unordered","span":{"column":17,"end":731,"endColumn":26,"endLine":47,"file":0,"line":47,"start":722},"type":{"kind":"Fn","params":[{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"}],"requires":null,"ret":{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"},"text":"fn(Map<Text, Mode>) -> Map<Text, Mode>"}},{"kind":"field","name":"items","receiver":59,"span":{"column":27,"end":739,"endColumn":34,"endLine":47,"file":0,"line":47,"start":732},"type":{"args":[{"kind":"Text","text":"Text"},{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}],"kind":"Map","text":"Map<Text, Mode>"}},{"kind":"name","name":"b","span":{"column":27,"end":733,"endColumn":28,"endLine":47,"file":0,"line":47,"start":732},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"}},{"cond":61,"else":null,"kind":"if","span":{"column":5,"end":788,"endColumn":6,"endLine":50,"file":0,"line":48,"start":747},"then":{"span":{"column":21,"end":788,"endColumn":6,"endLine":50,"file":0,"line":48,"start":763},"stmts":[16]},"type":{"kind":"Unit","text":"Unit"}},{"kind":"binary","left":62,"op":"==","right":63,"span":{"column":8,"end":762,"endColumn":20,"endLine":48,"file":0,"line":48,"start":750},"type":{"kind":"Bool","text":"Bool"}},{"kind":"name","name":"m","span":{"column":8,"end":751,"endColumn":9,"endLine":48,"file":0,"line":48,"start":750},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}},{"kind":"field","name":"On","receiver":64,"span":{"column":13,"end":762,"endColumn":20,"endLine":48,"file":0,"line":48,"start":755},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"}},{"kind":"name","name":"Mode","span":{"column":13,"end":759,"endColumn":17,"endLine":48,"file":0,"line":48,"start":755},"type":{"kind":"Unit","text":"Unit"}},{"args":[67],"callee":{"kind":"builtin","name":"ListPush"},"kind":"method","name":"push","namedArgs":null,"receiver":66,"span":{"column":7,"end":782,"endColumn":18,"endLine":49,"file":0,"line":49,"start":771},"type":{"kind":"Unit","text":"Unit"},"ufcs":false},{"kind":"name","name":"out","span":{"column":7,"end":774,"endColumn":10,"endLine":49,"file":0,"line":49,"start":771},"type":{"args":[{"kind":"Text","text":"Text"}],"kind":"List","text":"List<Text>"}},{"kind":"name","name":"k","span":{"column":16,"end":781,"endColumn":17,"endLine":49,"file":0,"line":49,"start":780},"type":{"kind":"Text","text":"Text"}},{"kind":"name","name":"out","span":{"column":10,"end":805,"endColumn":13,"endLine":52,"file":0,"line":52,"start":802},"type":{"args":[{"kind":"Text","text":"Text"}],"kind":"List","text":"List<Text>"}},{"arms":[{"body":71,"pattern":5,"span":{"column":3,"end":924,"endColumn":25,"endLine":62,"file":0,"line":62,"start":902}},{"body":72,"pattern":6,"span":{"column":3,"end":955,"endColumn":31,"endLine":63,"file":0,"line":63,"start":927}},{"body":75,"pattern":8,"span":{"column":3,"end":981,"endColumn":26,"endLine":64,"file":0,"line":64,"start":958}}],"kind":"match","scrutinee":70,"span":{"column":35,"end":983,"endColumn":2,"endLine":65,"file":0,"line":61,"start":890},"type":{"kind":"Text","text":"Text"}},{"kind":"name","name":"e","span":{"column":41,"end":897,"endColumn":42,"endLine":61,"file":0,"line":61,"start":896},"type":{"args":[],"kind":"Enum","module":"snip.written","name":"Error","text":"Error"}},{"kind":"str","span":{"column":18,"end":924,"endColumn":25,"endLine":62,"file":0,"line":62,"start":917},"type":{"kind":"Text","text":"Text"},"value":"empty"},{"args":[74],"callee":{"kind":"fn","module":"snip.written","name":"Bad.error"},"kind":"method","name":"error","namedArgs":null,"receiver":73,"span":{"column":19,"end":955,"endColumn":31,"endLine":63,"file":0,"line":63,"start":943},"type":{"kind":"Text","text":"Text"},"ufcs":true},{"kind":"name","name":"Bad","span":{"column":19,"end":946,"endColumn":22,"endLine":63,"file":0,"line":63,"start":943},"type":{"kind":"Unit","text":"Unit"}},{"kind":"name","name":"x","span":{"column":29,"end":954,"endColumn":30,"endLine":63,"file":0,"line":63,"start":953},"type":{"args":[],"kind":"Record","module":"snip.written","name":"Bad","text":"Bad"}},{"kind":"name","name":"text","span":{"column":22,"end":981,"endColumn":26,"endLine":64,"file":0,"line":64,"start":977},"type":{"kind":"Text","text":"Text"}},{"kind":"binary","left":77,"op":"+","right":78,"span":{"column":3,"end":1033,"endColumn":8,"endLine":68,"file":0,"line":68,"start":1028},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"a","span":{"column":3,"end":1029,"endColumn":4,"endLine":68,"file":0,"line":68,"start":1028},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"b","span":{"column":7,"end":1033,"endColumn":8,"endLine":68,"file":0,"line":68,"start":1032},"type":{"kind":"Int","text":"Int"}},{"kind":"name","name":"m","span":{"column":30,"end":1067,"endColumn":31,"endLine":71,"file":0,"line":71,"start":1066},"type":{"kind":"Param","name":"T","text":"T"}}],"files":["written.ignite"],"formatVersion":"ignite-typed/0.1","imports":[],"module":"snip.written","package":"snip.written","patterns":[{"args":[],"constant":null,"kind":"variant","path":["Mode","On"],"span":{"column":3,"end":100,"endColumn":10,"endLine":9,"file":0,"line":9,"start":93}},{"args":[],"constant":null,"kind":"variant","path":["Mode","Off"],"span":{"column":3,"end":119,"endColumn":11,"endLine":10,"file":0,"line":10,"start":111}},{"items":[3,4],"kind":"tuple","span":{"column":7,"end":718,"endColumn":13,"endLine":47,"file":0,"line":47,"start":712}},{"bindingType":{"kind":"Text","text":"Text"},"kind":"binding","name":"k","span":{"column":8,"end":714,"endColumn":9,"endLine":47,"file":0,"line":47,"start":713}},{"bindingType":{"args":[],"kind":"Enum","module":"snip.written","name":"Mode","text":"Mode"},"kind":"binding","name":"m","span":{"column":11,"end":717,"endColumn":12,"endLine":47,"file":0,"line":47,"start":716}},{"args":[],"constant":null,"kind":"variant","path":["Error","Empty"],"span":{"column":3,"end":913,"endColumn":14,"endLine":62,"file":0,"line":62,"start":902}},{"args":[7],"constant":null,"kind":"variant","path":["Error","Bad"],"span":{"column":3,"end":939,"endColumn":15,"endLine":63,"file":0,"line":63,"start":927}},{"bindingType":{"args":[],"kind":"Record","module":"snip.written","name":"Bad","text":"Bad"},"kind":"binding","name":"x","span":{"column":13,"end":938,"endColumn":14,"endLine":63,"file":0,"line":63,"start":937}},{"args":[9],"constant":null,"kind":"variant","path":["Error","Msg"],"span":{"column":3,"end":973,"endColumn":18,"endLine":64,"file":0,"line":64,"start":958}},{"bindingType":{"kind":"Text","text":"Text"},"kind":"binding","name":"text","span":{"column":13,"end":972,"endColumn":17,"endLine":64,"file":0,"line":64,"start":968}}],"stmts":[{"expr":0,"kind":"expr","span":{"column":34,"end":130,"endColumn":2,"endLine":11,"file":0,"line":8,"start":81}},{"kind":"return","span":{"column":3,"end":226,"endColumn":37,"endLine":18,"file":0,"line":18,"start":192},"value":4},{"bindingType":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},"declaredType":null,"kind":"let","mutable":true,"name":"b","span":{"column":3,"end":354,"endColumn":12,"endLine":27,"file":0,"line":27,"start":345},"value":10},{"expr":11,"kind":"expr","span":{"column":3,"end":433,"endColumn":4,"endLine":30,"file":0,"line":28,"start":357}},{"kind":"return","span":{"column":5,"end":429,"endColumn":56,"endLine":29,"file":0,"line":29,"start":378},"value":16},{"expr":25,"kind":"expr","span":{"column":3,"end":487,"endColumn":4,"endLine":33,"file":0,"line":31,"start":436}},{"kind":"return","span":{"column":5,"end":483,"endColumn":33,"endLine":32,"file":0,"line":32,"start":455},"value":29},{"kind":"assign","span":{"column":3,"end":524,"endColumn":37,"endLine":34,"file":0,"line":34,"start":490},"target":{"base":"b","fields":["count"],"ownerType":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},"span":{"column":3,"end":497,"endColumn":10,"endLine":34,"file":0,"line":34,"start":490}},"value":35},{"expr":40,"kind":"expr","span":{"column":3,"end":552,"endColumn":28,"endLine":35,"file":0,"line":35,"start":527}},{"kind":"return","span":{"column":3,"end":578,"endColumn":26,"endLine":36,"file":0,"line":36,"start":555},"value":46},{"bindingType":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},"declaredType":null,"kind":"let","mutable":true,"name":"b","span":{"column":3,"end":623,"endColumn":12,"endLine":40,"file":0,"line":40,"start":614},"value":52},{"kind":"assign","span":{"column":3,"end":637,"endColumn":14,"endLine":41,"file":0,"line":41,"start":626},"target":{"base":"b","fields":["count"],"ownerType":{"args":[],"kind":"Record","module":"snip.written","name":"Box","text":"Box"},"span":{"column":3,"end":633,"endColumn":10,"endLine":41,"file":0,"line":41,"start":626}},"value":53},{"expr":54,"kind":"expr","span":{"column":3,"end":641,"endColumn":4,"endLine":42,"file":0,"line":42,"start":640}},{"bindingType":{"args":[{"kind":"Text","text":"Text"}],"kind":"List","text":"List<Text>"},"declaredType":{"args":[{"kind":"Text","text":"Text"}],"kind":"List","text":"List<Text>"},"kind":"let","mutable":true,"name":"out","span":{"column":3,"end":705,"endColumn":27,"endLine":46,"file":0,"line":46,"start":681},"value":55},{"body":{"span":{"column":36,"end":792,"endColumn":4,"endLine":51,"file":0,"line":47,"start":741},"stmts":[15]},"iter":56,"kind":"forPattern","pattern":2,"span":{"column":3,"end":792,"endColumn":4,"endLine":51,"file":0,"line":47,"start":708}},{"expr":60,"kind":"expr","span":{"column":5,"end":788,"endColumn":6,"endLine":50,"file":0,"line":48,"start":747}},{"expr":65,"kind":"expr","span":{"column":7,"end":782,"endColumn":18,"endLine":49,"file":0,"line":49,"start":771}},{"kind":"return","span":{"column":3,"end":805,"endColumn":13,"endLine":52,"file":0,"line":52,"start":795},"value":68},{"expr":69,"kind":"expr","span":{"column":35,"end":983,"endColumn":2,"endLine":65,"file":0,"line":61,"start":890}},{"expr":76,"kind":"expr","span":{"column":3,"end":1033,"endColumn":8,"endLine":68,"file":0,"line":68,"start":1028}},{"expr":79,"kind":"expr","span":{"column":30,"end":1067,"endColumn":31,"endLine":71,"file":0,"line":71,"start":1066}}]}"##
