@@ -93,6 +93,30 @@ the typed JSON to `cir/1`. Ignite constructs with no `cir/1` node are `foreign` 
 `refusals` entry: declarations of systems, components, protocols and contracts; `spawn` and `await`;
 capability resources; closures until `cir/1` has a node for them.
 
+### As read (C3, `src/read.ignite`)
+
+- `codespec-read-ignite SOURCE` runs `ignite emit --typed-json SOURCE` with the program the
+  setting `--ignite` names (default `ignite` on `PATH`; `codespec read` passes no setting, so the
+  task puts the pinned compiler first on `PATH` as `ignite`) and prints the module on stdout in
+  canonical form. The mapping table is the file's header; each row has an inline test.
+- The module is the last segment of the package; positions are `<file name>:<line>`; the reader
+  is `{ignite, codespec-read-ignite, 0.0.0}`; every declaration is `exported`.
+- Inverse of the writer where it writes: `fn E.value` becomes the enum's values, the writer's
+  `enum Error` with `fn Error.text` becomes sentinels (`Msg(t)` is `errorf("%s", t)`),
+  `wrapping_add`/`wrapping_sub` become `+`/`-`, `x = x + 1` is `incr`, `T.m(r: T, ..)` is a
+  method, `let x = match m.get(k) { Some(x) => x, None => { .. return } }` is `lookup_else`.
+- An enum without a `value` fn gets the values 0, 1, … (no Ignite program observes them). A
+  union variant's payload fields are `f0`, `f1`, …. Text literals are written in Go's (JSON's)
+  spelling, which the writer decodes.
+- Not expressible, so refused: generic types and functions, records with non-zero field
+  defaults, union values and `match` that takes data apart, `Result` with another error type,
+  `?`, closures, `while`/`loop`, list literals, `assert`, effects. Tests are not read.
+- Known gaps: the typed document resolves aliases, so a newtype's uses read as its underlying
+  type; Ignite's `Int` operators fail on overflow where cir/1's wrap; a map loop iterates in key
+  order in Ignite and in no order in cir/1 (`unordered_iteration` then marks it).
+- `examples/ledger/reference.cir.json` is the reader's document of the ledger reference, kept
+  byte-equal by `task read-ledger`.
+
 ## 5. Evidence
 
 A translation is accepted only by codespec's comparison harness (codespec M1): the original and the
