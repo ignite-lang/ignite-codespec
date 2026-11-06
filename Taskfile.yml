@@ -2,9 +2,49 @@ version: "3"
 
 vars:
   IGNITE: '{{.IGNITE | default "ignite"}}'
+  CODESPEC_DIR: '{{.CODESPEC_DIR | default "../codespec"}}'
 
 tasks:
   check:
     desc: Check every Ignite source file
     cmds:
       - for f in $(find src tools -name '*.ignite' 2>/dev/null); do {{.IGNITE}} check "$f" || exit 1; done
+      - task: cir-model
+
+  cir-model:
+    desc: The cir/1 model is current, every example document round trips, the inline tests pass
+    cmds:
+      - task: model-check
+      - task: roundtrip-check
+      - task: test-cir
+
+  build-gen-model:
+    internal: true
+    cmds:
+      - '{{.IGNITE}} build tools/gen_model.ignite --out target/ignite/gen_model'
+
+  model:
+    desc: Regenerate src/cir.ignite from schemas/cir-1.schema.json of CODESPEC_DIR
+    cmds:
+      - task: build-gen-model
+      - target/ignite/gen_model/bin/gen-model --codespec {{.CODESPEC_DIR}}
+
+  model-check:
+    desc: Fail when src/cir.ignite differs by one byte from what the schema of CODESPEC_DIR generates
+    cmds:
+      - task: build-gen-model
+      - mkdir -p target/model
+      - target/ignite/gen_model/bin/gen-model --codespec {{.CODESPEC_DIR}} --out target/model/cir.ignite
+      - cmp src/cir.ignite target/model/cir.ignite
+
+  roundtrip-check:
+    desc: Read and re-encode every examples/*/*.cir.json of CODESPEC_DIR and of this repository, byte-equal
+    cmds:
+      - '{{.IGNITE}} build src/cir_json.ignite --out target/ignite/cir_roundtrip'
+      - target/ignite/cir_roundtrip/bin/cir-roundtrip --root {{.CODESPEC_DIR}}
+      - if ls examples/*/*.cir.json >/dev/null 2>&1; then target/ignite/cir_roundtrip/bin/cir-roundtrip --root .; else echo "no examples/*/*.cir.json in this repository"; fi
+
+  test-cir:
+    desc: Run the inline tests of the model reader and writer and of the generator
+    cmds:
+      - '{{.IGNITE}} test src/cir_json.ignite tools/gen_model.ignite --out target/ignite-test'

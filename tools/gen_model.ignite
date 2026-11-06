@@ -1,0 +1,843 @@
+package tools
+
+import std.json.{Json, parse, get}
+import std.fs.{read_text_file, write_text_file}
+import std.text.{split, slice, to_upper}
+import std.io.IoError
+
+// gen-model: writes `src/cir.ignite`, the cir/1 model in Ignite, from codespec's
+// `schemas/cir-1.schema.json` (`task model`; `task model-check` compares). The schema is the
+// one definition of cir/1; this program maps it and refuses every construct it does not know,
+// so a schema change is a generator change and never a silent approximation.
+//
+// The schema says which properties exist and which are required. It does not say two things
+// the canonical encoding depends on, and both come from codespec's model
+// (`crates/model/src/lib.rs`), not from the schema:
+//   - Key order. The schema lists properties by name; codespec writes them in declaration
+//     order. The `required` list keeps that order, so the required properties are placed by
+//     it, and `PLACEMENTS` places every optional property after the one it follows there.
+//     An optional property without a placement, or a placement without its property, is
+//     refused, so the table cannot fall behind the schema unnoticed.
+//   - Omission. Every optional property of cir/1 is omitted when empty (`""`, `[]`, absent),
+//     and a nullable one (`T | null`) is absent when `None`. An optional property of another
+//     shape is refused.
+
+const SCHEMA_PATH: Text = "schemas/cir-1.schema.json"
+const DEFS_PREFIX: Text = "#/$defs/"
+
+// Where each optional property goes: (owner, property, the property it follows; "" for the
+// first after `k`). The owner is a definition, or `Definition.kind` for one arm of a tagged
+// definition.
+fn placements() -> List<(Text, Text, Text)> = [
+  ("Module", "doc", "reader"),
+  ("Module", "consts", "types"),
+  ("Module", "errors", "consts"),
+  ("Module", "facts", "layout"),
+  ("Module", "refusals", "facts"),
+  ("Facts", "messages", "shared"),
+  ("Facts", "comma_ok", "messages"),
+  ("Facts", "fallible", "comma_ok"),
+  ("Facts", "read_only", "fallible"),
+  ("Facts", "displays", "read_only"),
+  ("Facts", "unordered_iteration", "displays"),
+  ("Func", "recv", "exported"),
+  ("Func", "doc", "body"),
+  ("TypeDecl.struct", "doc", "fields"),
+  ("TypeDecl.newtype", "doc", "under"),
+  ("TypeDecl.enum", "doc", "variants"),
+  ("TypeDecl.union", "doc", "variants"),
+  ("Stmt.assign", "op", ""),
+  ("Stmt.if", "else", "then"),
+  ("Stmt.switch", "tag", "")
+]
+
+// ---- the schema, as far as cir/1 uses JSON Schema ------------------------------------------
+
+// The value of one property: a string, a boolean, an array, a definition, or a definition or
+// null.
+enum Shape {
+  Str,
+  Boolean,
+  ListOf(Shape),
+  Ref(Text),
+  Nullable(Text)
+}
+
+type Prop {
+  name: Text
+  shape: Shape
+  required: Bool
+}
+
+// One arm of a tagged definition: the value of its `k` and its other properties.
+type Arm {
+  kind: Text
+  description: Text
+  props: List<Prop>
+}
+
+enum Def {
+  Record(Text, Text, List<Prop>),
+  Tagged(Text, Text, List<Arm>),
+  Values(Text, Text, List<Text>)
+}
+
+fn has(names: List<Text>, name: Text) -> Bool {
+  for n in names {
+    if n == name {
+      return true
+    }
+  }
+  false
+}
+
+fn member_names(value: Json) -> List<Text> = match value {
+  Json.Object(members) => members.map(|m| m.0)
+  _ => []
+}
+
+// Refuses a schema keyword of `value` that is not in `allowed`.
+fn only_keys(value: Json, allowed: List<Text>, at: Text) -> Result<Unit, Text> {
+  for name in member_names(value) {
+    if !has(allowed, name) {
+      return Err(at + ": unsupported schema keyword `" + name + "`")
+    }
+  }
+  Ok(())
+}
+
+fn text_of(value: Json, name: Text, at: Text) -> Result<Text, Text> = match get(value, name) {
+  Some(Json.Str(text)) => Ok(text)
+  Some(_) => Err(at + "/" + name + ": expected a string")
+  Option.None => Err(at + ": missing `" + name + "`")
+}
+
+fn description_of(value: Json) -> Text = match get(value, "description") {
+  Some(Json.Str(text)) => text
+  _ => ""
+}
+
+fn ref_name(value: Json, at: Text) -> Result<Text, Text> {
+  let target = text_of(value, "$ref", at)?
+  match target.strip_prefix(DEFS_PREFIX) {
+    Some(name) => Ok(name)
+    Option.None => Err(at + ": `$ref` outside `" + DEFS_PREFIX + "`: " + target)
+  }
+}
+
+fn is_null_schema(value: Json) -> Bool = match value {
+  Json.Object(members) => members.len() == 1 && get(value, "type") == Some(Json.Str("null"))
+  _ => false
+}
+
+// The shape of the property schema `value` at `at`.
+fn shape_of(value: Json, at: Text) -> Result<Shape, Text> {
+  only_keys(value, ["type", "items", "$ref", "anyOf", "description"], at)?
+  match get(value, "$ref") {
+    Some(_) => return Ok(Shape.Ref(ref_name(value, at)?))
+    Option.None => {}
+  }
+  match get(value, "anyOf") {
+    Some(Json.Array(arms)) => {
+      if arms.len() == 2 && is_null_schema(arms[1]) {
+        only_keys(arms[0], ["$ref"], at + "/anyOf/0")?
+        return Ok(Shape.Nullable(ref_name(arms[0], at + "/anyOf/0")?))
+      }
+      return Err(at + ": an `anyOf` other than a definition or null")
+    }
+    Some(_) => return Err(at + "/anyOf: expected an array")
+    Option.None => {}
+  }
+  match text_of(value, "type", at)? {
+    "string" => Ok(Shape.Str)
+    "boolean" => Ok(Shape.Boolean)
+    "array" => match get(value, "items") {
+      Some(items) => match shape_of(items, at + "/items")? {
+        Shape.ListOf(_) => Err(at + "/items: an array of arrays")
+        Shape.Nullable(_) => Err(at + "/items: an array of nullable values")
+        item => Ok(Shape.ListOf(item))
+      }
+      Option.None => Err(at + ": an array without `items`")
+    }
+    other => Err(at + ": unsupported type `" + other + "`")
+  }
+}
+
+fn texts_of(value: Json, name: Text, at: Text) -> Result<List<Text>, Text> {
+  let items = match get(value, name) {
+    Some(Json.Array(items)) => items
+    Some(_) => return Err(at + "/" + name + ": expected an array")
+    Option.None => return Ok([])
+  }
+  var out: List<Text> = []
+  for item in items {
+    match item {
+      Json.Str(text) => out.push(text)
+      _ => return Err(at + "/" + name + ": expected strings")
+    }
+  }
+  Ok(out)
+}
+
+// `names` with `name` inserted after `after` ("" inserts it first).
+fn insert_after(names: List<Text>, name: Text, after: Text) -> Option<List<Text>> {
+  var out: List<Text> = []
+  var done = false
+  if after == "" {
+    out.push(name)
+    done = true
+  }
+  for n in names {
+    out.push(n)
+    if n == after && !done {
+      out.push(name)
+      done = true
+    }
+  }
+  if done { Some(out) } else { Option.None }
+}
+
+// The canonical order of the properties of `owner`: `required` as listed (without `k`), each
+// optional one inserted by `PLACEMENTS`.
+fn ordered(owner: Text, required: List<Text>, optional: List<Text>) -> Result<List<Text>, Text> {
+  var names: List<Text> = []
+  for name in required {
+    if name != "k" {
+      names.push(name)
+    }
+  }
+  var placed: List<Text> = []
+  for (who, name, after) in placements() {
+    if who == owner {
+      if !has(optional, name) {
+        return Err(owner + ": a placement of `" + name + "`, which is not an optional property of the schema")
+      }
+      names = match insert_after(names, name, after) {
+        Some(more) => more
+        Option.None => return Err(owner + ": `" + name + "` is placed after `" + after + "`, which it does not have")
+      }
+      placed.push(name)
+    }
+  }
+  for name in optional {
+    if !has(placed, name) {
+      return Err(owner + ": the optional property `" + name + "` has no placement in PLACEMENTS")
+    }
+  }
+  Ok(names)
+}
+
+// The properties of the object schema `value` of `owner`, in canonical order, without `k`.
+fn props_of(owner: Text, value: Json, at: Text) -> Result<List<Prop>, Text> {
+  if get(value, "additionalProperties") != Some(Json.Bool(false)) {
+    return Err(at + ": an object without `additionalProperties: false` cannot be read strictly")
+  }
+  let properties = match get(value, "properties") {
+    Some(Json.Object(members)) => members
+    _ => return Err(at + ": an object without `properties`")
+  }
+  let required = texts_of(value, "required", at)?
+  var optional: List<Text> = []
+  for (name, _) in properties {
+    if !has(required, name) {
+      optional.push(name)
+    }
+  }
+  for name in required {
+    if !has(member_names(Json.Object(properties)), name) {
+      return Err(at + ": `" + name + "` is required but not a property")
+    }
+  }
+  var props: List<Prop> = []
+  for name in ordered(owner, required, optional)? {
+    let schema = match get(Json.Object(properties), name) {
+      Some(schema) => schema
+      Option.None => return Err(at + ": no property `" + name + "`")
+    }
+    let shape = shape_of(schema, at + "/properties/" + name)?
+    let is_required = has(required, name)
+    if !is_required {
+      match shape {
+        Shape.Str => {}
+        Shape.ListOf(_) => {}
+        Shape.Nullable(_) => {}
+        _ => return Err(at + "/properties/" + name + ": an optional property with no empty value to omit")
+      }
+    }
+    props.push(Prop { name = name, shape = shape, required = is_required })
+  }
+  Ok(props)
+}
+
+// The value of `k` of one arm of a tagged definition.
+fn kind_const(arm: Json, at: Text) -> Result<Text, Text> {
+  let properties = match get(arm, "properties") {
+    Some(properties) => properties
+    Option.None => return Err(at + ": an arm without `properties`")
+  }
+  match get(properties, "k") {
+    Some(k) => {
+      only_keys(k, ["type", "const"], at + "/properties/k")?
+      if get(k, "type") != Some(Json.Str("string")) {
+        return Err(at + "/properties/k: not a string")
+      }
+      text_of(k, "const", at + "/properties/k")
+    }
+    Option.None => Err(at + ": an arm without `k`")
+  }
+}
+
+fn def_of(name: Text, value: Json, at: Text) -> Result<Def, Text> {
+  let description = description_of(value)
+  match get(value, "oneOf") {
+    Some(Json.Array(arms)) => {
+      only_keys(value, ["description", "oneOf"], at)?
+      var out: List<Arm> = []
+      var kinds: List<Text> = []
+      var i = 0
+      for arm in arms {
+        let arm_at = at + "/oneOf/" + i.to_text()
+        only_keys(arm, ["description", "type", "properties", "additionalProperties", "required"], arm_at)?
+        let kind = kind_const(arm, arm_at)?
+        if has(kinds, kind) {
+          return Err(arm_at + ": the kind `" + kind + "` twice")
+        }
+        if texts_of(arm, "required", arm_at)?.len() == 0 || texts_of(arm, "required", arm_at)?[0] != "k" {
+          return Err(arm_at + ": `k` is not the first required property")
+        }
+        kinds.push(kind)
+        out.push(Arm { kind = kind, description = description_of(arm), props = props_of(name + "." + kind, arm, arm_at)? })
+        i = i + 1
+      }
+      return Ok(Def.Tagged(name, description, out))
+    }
+    Some(_) => return Err(at + "/oneOf: expected an array")
+    Option.None => {}
+  }
+  match text_of(value, "type", at)? {
+    "object" => {
+      only_keys(value, ["$schema", "$defs", "title", "description", "type", "properties", "additionalProperties", "required"], at)?
+      Ok(Def.Record(name, description, props_of(name, value, at)?))
+    }
+    "string" => {
+      only_keys(value, ["description", "type", "enum"], at)?
+      let values = texts_of(value, "enum", at)?
+      if values.is_empty() {
+        return Err(at + ": a string definition without `enum`")
+      }
+      Ok(Def.Values(name, description, values))
+    }
+    other => Err(at + ": unsupported definition type `" + other + "`")
+  }
+}
+
+// Every definition of the schema: the root (named by its `title`), then `$defs` in order.
+fn defs_of(schema: Json) -> Result<List<Def>, Text> {
+  let root = text_of(schema, "title", "#")?
+  var out: List<Def> = [def_of(root, schema, "#")?]
+  match get(schema, "$defs") {
+    Some(Json.Object(members)) => {
+      for (name, value) in members {
+        out.push(def_of(name, value, "#/$defs/" + name)?)
+      }
+    }
+    _ => return Err("#: no `$defs`")
+  }
+  Ok(out)
+}
+
+// ---- names ---------------------------------------------------------------------------------
+
+const KEYWORDS: List<Text> = [
+  "package", "import", "type", "enum", "fn", "system", "protocol", "const", "resource",
+  "component", "contract", "policy", "assembly", "let", "var", "return", "match", "if", "else",
+  "while", "loop", "for", "in", "break", "continue", "await", "spawn", "requires", "test",
+  "assert", "true", "false"
+]
+
+// Builtin type names a definition must not take.
+const BUILTINS: List<Text> = ["Module", "Int", "Byte", "Bool", "Text", "Bytes", "Unit", "List", "Map", "Option", "Result", "Json"]
+
+// `snake_case` as `UpperCamel`; a part starting with a digit gets `V` before it.
+fn upper_camel(snake: Text) -> Text {
+  var out = ""
+  for part in split(snake, "_") {
+    if part.is_empty() {
+      continue
+    }
+    let first = slice(part, 0, 1)
+    let rest = slice(part, 1, part.len())
+    out = if part.to_bytes().at(0) >= b'0' && part.to_bytes().at(0) <= b'9' { out + "V" + part } else { out + to_upper(first) + rest }
+  }
+  out
+}
+
+fn type_name(def: Text) -> Text = if has(BUILTINS, def) { "Cir" + def } else { def }
+
+fn arm_type(def: Text, kind: Text) -> Text = upper_camel(kind) + def
+
+fn field_name(name: Text) -> Text = if has(KEYWORDS, name) { name + "_" } else { name }
+
+fn ignite_type(shape: Shape) -> Text = match shape {
+  Shape.Str => "Text"
+  Shape.Boolean => "Bool"
+  Shape.ListOf(item) => "List<" + ignite_type(item) + ">"
+  Shape.Ref(name) => type_name(name)
+  Shape.Nullable(name) => "Option<" + type_name(name) + ">"
+}
+
+fn quoted(text: Text) -> Text = "\"" + text + "\""
+
+// The decoder of one value of `shape`, a `fn(Json, Text) -> Result<T, ReadError>`.
+fn decoder(shape: Shape) -> Text = match shape {
+  Shape.Str => "decode_text"
+  Shape.Boolean => "decode_bool"
+  Shape.Ref(name) => type_name(name) + ".from_json"
+  _ => "unreachable"
+}
+
+// The encoder of one value of `shape`, a `fn(T) -> Json`.
+fn encoder(shape: Shape) -> Text = match shape {
+  Shape.Str => "encode_text"
+  Shape.Boolean => "encode_bool"
+  Shape.Ref(name) => type_name(name) + ".to_json"
+  _ => "unreachable"
+}
+
+// ---- emission ------------------------------------------------------------------------------
+
+fn comment_lines(text: Text, indent: Text) -> List<Text> {
+  var out: List<Text> = []
+  if text.is_empty() {
+    return out
+  }
+  for line in split(text, "\n") {
+    out.push(indent + "// " + line)
+  }
+  out
+}
+
+fn record_lines(name: Text, description: Text, props: List<Prop>) -> List<Text> {
+  var out = comment_lines(description, "")
+  if props.is_empty() {
+    out.push("type " + name + r" {}")
+    return out
+  }
+  out.push("type " + name + r" {")
+  for prop in props {
+    out.push("  " + field_name(prop.name) + ": " + ignite_type(prop.shape))
+  }
+  out.push(r"}")
+  out
+}
+
+// The expression that decodes `prop` out of `members` of the object at `path`.
+fn decode_expression(prop: Prop) -> Text {
+  let name = quoted(prop.name)
+  let at = "path + \"." + prop.name + "\""
+  if prop.required {
+    let member = "required(members, " + name + ", path)?"
+    return match prop.shape {
+      Shape.ListOf(item) => "decode_list(" + member + ", " + at + ", " + decoder(item) + ")?"
+      Shape.Nullable(target) => "decode_nullable(" + member + ", " + at + ", " + type_name(target) + ".from_json)?"
+      shape => decoder(shape) + "(" + member + ", " + at + ")?"
+    }
+  }
+  match prop.shape {
+    Shape.ListOf(item) => "optional_list(members, " + name + ", path, " + decoder(item) + ")?"
+    Shape.Nullable(target) => "optional_nullable(members, " + name + ", path, " + type_name(target) + ".from_json)?"
+    _ => "optional_text(members, " + name + ", path)?"
+  }
+}
+
+// The statements that add `prop` of `value` to `members`.
+fn encode_lines(prop: Prop) -> List<Text> {
+  let field = "value." + field_name(prop.name)
+  let name = quoted(prop.name)
+  let json = match prop.shape {
+    Shape.ListOf(item) => "Json.Array(" + field + ".map(" + encoder(item) + "))"
+    Shape.Nullable(target) => "encode_nullable(" + field + ", " + type_name(target) + ".to_json)"
+    shape => encoder(shape) + "(" + field + ")"
+  }
+  let push = "members.push((" + name + ", " + json + "))"
+  if prop.required {
+    return ["  " + push]
+  }
+  match prop.shape {
+    Shape.Nullable(target) => [
+      "  match " + field + r" {",
+      "    Some(present) => members.push((" + name + ", " + type_name(target) + ".to_json(present)))",
+      r"    Option.None => {}",
+      r"  }"
+    ]
+    _ => [
+      "  if !" + field + r".is_empty() {",
+      "    " + push,
+      r"  }"
+    ]
+  }
+}
+
+// `from_json` and `to_json` of a record; `kind` is the value of `k` for an arm, else "".
+fn codec_lines(name: Text, kind: Text, props: List<Prop>) -> List<Text> {
+  var known: List<Text> = []
+  if kind != "" {
+    known.push(quoted("k"))
+  }
+  for prop in props {
+    known.push(quoted(prop.name))
+  }
+  var out: List<Text> = [
+    "",
+    "fn " + name + ".from_json(value: Json, path: Text) -> Result<" + name + r", ReadError> {",
+    "  let members = members_of(value, path, [" + known.join(", ") + "])?"
+  ]
+  if props.is_empty() {
+    out.push("  Ok(" + name + r" {})")
+  } else {
+    out.push("  Ok(" + name + r" {")
+    var i = 0
+    for prop in props {
+      let comma = if i + 1 < props.len() { "," } else { "" }
+      out.push("    " + field_name(prop.name) + " = " + decode_expression(prop) + comma)
+      i = i + 1
+    }
+    out.push(r"  })")
+  }
+  out.push(r"}")
+  out.push("")
+  out.push("fn " + name + ".to_json(value: " + name + r") -> Json {")
+  if kind != "" {
+    out.push("  var members: List<(Text, Json)> = [(\"k\", Json.Str(" + quoted(kind) + "))]")
+  } else {
+    out.push("  var members: List<(Text, Json)> = []")
+  }
+  for prop in props {
+    out.append(encode_lines(prop))
+  }
+  out.push("  Json.Object(members)")
+  out.push(r"}")
+  out
+}
+
+fn tagged_lines(def: Text, description: Text, arms: List<Arm>) -> List<Text> {
+  let name = type_name(def)
+  var out = comment_lines(description, "")
+  out.push("enum " + name + r" {")
+  var i = 0
+  for arm in arms {
+    let comma = if i + 1 < arms.len() { "," } else { "" }
+    let payload = if arm.props.is_empty() { "" } else { "(" + arm_type(def, arm.kind) + ")" }
+    out.append(comment_lines(arm.description, "  "))
+    out.push("  " + upper_camel(arm.kind) + payload + comma)
+    i = i + 1
+  }
+  out.push(r"}")
+  out.push("")
+  out.push("fn " + name + ".from_json(value: Json, path: Text) -> Result<" + name + r", ReadError> = match kind_of(value, path)? {")
+  for arm in arms {
+    let variant = name + "." + upper_camel(arm.kind)
+    if arm.props.is_empty() {
+      out.push("  " + quoted(arm.kind) + r" => {")
+      out.push("    members_of(value, path, [\"k\"])?")
+      out.push("    Ok(" + variant + ")")
+      out.push(r"  }")
+    } else {
+      out.push("  " + quoted(arm.kind) + " => Ok(" + variant + "(" + arm_type(def, arm.kind) + ".from_json(value, path)?))")
+    }
+  }
+  out.push("  other => refusal(path + \".k\", \"unknown kind `\" + other + \"` of " + def + "\")")
+  out.push(r"}")
+  out.push("")
+  out.push("fn " + name + ".to_json(value: " + name + r") -> Json = match value {")
+  for arm in arms {
+    let variant = name + "." + upper_camel(arm.kind)
+    if arm.props.is_empty() {
+      out.push("  " + variant + " => Json.Object([(\"k\", Json.Str(" + quoted(arm.kind) + "))])")
+    } else {
+      out.push("  " + variant + "(payload) => " + arm_type(def, arm.kind) + ".to_json(payload)")
+    }
+  }
+  out.push(r"}")
+  for arm in arms {
+    if !arm.props.is_empty() {
+      out.push("")
+      out.append(record_lines(arm_type(def, arm.kind), "The fields of `" + def + "` kind `" + arm.kind + "`.", arm.props))
+      out.append(codec_lines(arm_type(def, arm.kind), arm.kind, arm.props))
+    }
+  }
+  out
+}
+
+fn values_lines(def: Text, description: Text, values: List<Text>) -> List<Text> {
+  let name = type_name(def)
+  var out = comment_lines(description, "")
+  out.push("enum " + name + r" {")
+  var i = 0
+  for value in values {
+    let comma = if i + 1 < values.len() { "," } else { "" }
+    out.push("  " + upper_camel(value) + comma)
+    i = i + 1
+  }
+  out.push(r"}")
+  out.push("")
+  out.push("fn " + name + ".from_json(value: Json, path: Text) -> Result<" + name + r", ReadError> = match value {")
+  for value in values {
+    out.push("  Json.Str(" + quoted(value) + ") => Ok(" + name + "." + upper_camel(value) + ")")
+  }
+  out.push("  Json.Str(other) => refusal(path, \"unknown value `\" + other + \"` of " + def + "\")")
+  out.push("  _ => refusal(path, \"expected a string\")")
+  out.push(r"}")
+  out.push("")
+  out.push("fn " + name + ".to_json(value: " + name + r") -> Json = match value {")
+  for value in values {
+    out.push("  " + name + "." + upper_camel(value) + " => Json.Str(" + quoted(value) + ")")
+  }
+  out.push(r"}")
+  out
+}
+
+fn def_lines(def: Def) -> List<Text> = match def {
+  Def.Record(name, description, props) => {
+    var out = record_lines(type_name(name), description, props)
+    out.append(codec_lines(type_name(name), "", props))
+    out
+  }
+  Def.Tagged(name, description, arms) => tagged_lines(name, description, arms)
+  Def.Values(name, description, values) => values_lines(name, description, values)
+}
+
+// The helpers every decoder and encoder calls.
+const PRELUDE: Text = r#"// ---- reading and writing helpers ----------------------------------------------------------
+
+// Why a document is not cir/1: the JSON path of the offending value (`$` is the document,
+// `.name` a member, `[i]` an element) and the reason.
+type ReadError {
+  path: Text
+  message: Text
+}
+
+fn describe(error: ReadError) -> Text = error.path + ": " + error.message
+
+fn refusal<T>(path: Text, message: Text) -> Result<T, ReadError> = Err(ReadError { path = path, message = message })
+
+fn has_name(names: List<Text>, name: Text) -> Bool {
+  for n in names {
+    if n == name {
+      return true
+    }
+  }
+  false
+}
+
+// The members of the object `value`; a member not in `known`, or one given twice, is refused.
+fn members_of(value: Json, path: Text, known: List<Text>) -> Result<List<(Text, Json)>, ReadError> {
+  let members = match value {
+    Json.Object(members) => members
+    _ => return refusal(path, "expected an object")
+  }
+  var seen: List<Text> = []
+  for member in members {
+    if !has_name(known, member.0) {
+      return refusal(path + "." + member.0, "unknown field `" + member.0 + "`")
+    }
+    if has_name(seen, member.0) {
+      return refusal(path + "." + member.0, "duplicate field `" + member.0 + "`")
+    }
+    seen.push(member.0)
+  }
+  Ok(members)
+}
+
+fn member(members: List<(Text, Json)>, name: Text) -> Option<Json> {
+  for m in members {
+    if m.0 == name {
+      return Some(m.1)
+    }
+  }
+  Option.None
+}
+
+fn required(members: List<(Text, Json)>, name: Text, path: Text) -> Result<Json, ReadError> = match member(members, name) {
+  Some(value) => Ok(value)
+  Option.None => refusal(path, "missing field `" + name + "`")
+}
+
+// The kind `k` of the tagged object `value`.
+fn kind_of(value: Json, path: Text) -> Result<Text, ReadError> {
+  let members = match value {
+    Json.Object(members) => members
+    _ => return refusal(path, "expected an object")
+  }
+  match member(members, "k") {
+    Some(Json.Str(kind)) => Ok(kind)
+    Some(_) => refusal(path + ".k", "expected a string")
+    Option.None => refusal(path, "missing field `k`")
+  }
+}
+
+fn decode_text(value: Json, path: Text) -> Result<Text, ReadError> = match value {
+  Json.Str(text) => Ok(text)
+  _ => refusal(path, "expected a string")
+}
+
+fn decode_bool(value: Json, path: Text) -> Result<Bool, ReadError> = match value {
+  Json.Bool(b) => Ok(b)
+  _ => refusal(path, "expected a boolean")
+}
+
+fn decode_list<T>(value: Json, path: Text, item: fn(Json, Text) -> Result<T, ReadError>) -> Result<List<T>, ReadError> {
+  let items = match value {
+    Json.Array(items) => items
+    _ => return refusal(path, "expected an array")
+  }
+  var out: List<T> = []
+  var i = 0
+  for element in items {
+    out.push(item(element, path + "[" + i.to_text() + "]")?)
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_nullable<T>(value: Json, path: Text, item: fn(Json, Text) -> Result<T, ReadError>) -> Result<Option<T>, ReadError> = match value {
+  Json.Null => Ok(Option.None)
+  present => Ok(Some(item(present, path)?))
+}
+
+// An optional string: `""` when absent.
+fn optional_text(members: List<(Text, Json)>, name: Text, path: Text) -> Result<Text, ReadError> = match member(members, name) {
+  Some(value) => decode_text(value, path + "." + name)
+  Option.None => Ok("")
+}
+
+// An optional array: `[]` when absent.
+fn optional_list<T>(members: List<(Text, Json)>, name: Text, path: Text, item: fn(Json, Text) -> Result<T, ReadError>) -> Result<List<T>, ReadError> = match member(members, name) {
+  Some(value) => decode_list(value, path + "." + name, item)
+  Option.None => Ok(List.empty())
+}
+
+// An optional nullable value: `None` when absent or null.
+fn optional_nullable<T>(members: List<(Text, Json)>, name: Text, path: Text, item: fn(Json, Text) -> Result<T, ReadError>) -> Result<Option<T>, ReadError> = match member(members, name) {
+  Some(value) => decode_nullable(value, path + "." + name, item)
+  Option.None => Ok(Option.None)
+}
+
+fn encode_text(text: Text) -> Json = Json.Str(text)
+
+fn encode_bool(b: Bool) -> Json = Json.Bool(b)
+
+fn encode_nullable<T>(value: Option<T>, item: fn(T) -> Json) -> Json = match value {
+  Some(present) => item(present)
+  Option.None => Json.Null
+}"#
+
+// The text of `src/cir.ignite` for `schema`, read from codespec at `pin`.
+fn generate(schema_text: Text, pin: Text) -> Result<Text, Text> {
+  let schema = match parse(schema_text) {
+    Ok(schema) => schema
+    Err(e) => return Err(SCHEMA_PATH + ": not JSON: " + e.message + " at byte " + e.offset.to_text())
+  }
+  let defs = defs_of(schema)?
+  var out: List<Text> = [
+    "package codespec.cir",
+    "",
+    r"import std.json.{Json}",
+    "",
+    "// Generated by tools/gen_model.ignite (`task model`): do not edit.",
+    "// Source: " + SCHEMA_PATH + " of codespec " + pin + ".",
+    "//",
+    "// The cir/1 model: one type per schema definition (`Module` is `CirModule`), each with",
+    "// `T.from_json(value, path)`, which reads strictly (an unknown or repeated field, an unknown",
+    "// kind or value, a missing required field and a value of the wrong JSON kind are refused",
+    "// with the JSON path), and `T.to_json(value)`, which writes the members in codespec's",
+    "// declaration order and omits an optional member that is empty. A tagged definition is an",
+    "// enum whose arm `k` holds the record `<Kind><Definition>`.",
+    ""
+  ]
+  for def in defs {
+    out.append(def_lines(def))
+    out.push("")
+  }
+  out.push(PRELUDE)
+  Ok(out.join("\n") + "\n")
+}
+
+fn is_hex(text: Text) -> Bool {
+  for b in text.to_bytes() {
+    if !((b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f')) {
+      return false
+    }
+  }
+  true
+}
+
+// ---- the executable ------------------------------------------------------------------------
+
+type ModelGenerator {
+  codespec: Directory
+  repo: Directory
+  output: Setting
+  executable: Text
+}
+
+// Reads `codespec.pin` and the schema, writes the model to `--out` (relative to the working
+// directory); exit 1 with the reason when the pin or the schema is refused.
+fn ModelGenerator.main(self: ModelGenerator) -> Result<Unit, IoError> {
+  let pin = read_text_file(self.repo, "codespec.pin")?.trim()
+  if pin.len() != 40 || !is_hex(pin) {
+    log("gen-model: codespec.pin: not a 40-digit commit id: " + pin)
+    Process.exit(1)
+  }
+  let schema = read_text_file(self.codespec, SCHEMA_PATH)?
+  match generate(schema, pin) {
+    Ok(text) => write_text_file(self.repo, self.output.value(), text)
+    Err(reason) => {
+      log("gen-model: " + reason)
+      Process.exit(1)
+    }
+  }
+}
+
+system GenModel {
+  resource codespec: Directory { path = "../codespec", flag = "--codespec" }
+  resource repo: Directory { path = "." }
+  resource output: Setting { flag = "--out", default = "src/cir.ignite" }
+
+  component generator: ModelGenerator {
+    codespec = codespec
+    repo = repo
+    output = output
+    executable = "gen-model"
+  }
+}
+
+// ---- tests ---------------------------------------------------------------------------------
+
+test "names follow the definitions" {
+  assert upper_camel("lookup_else") == "LookupElse"
+  assert upper_camel("to_error") == "ToError"
+  assert upper_camel("8") == "V8"
+  assert upper_camel("platform") == "Platform"
+  assert type_name("Module") == "CirModule"
+  assert type_name("Expr") == "Expr"
+  assert field_name("else") == "else_"
+  assert field_name("then") == "then"
+}
+
+test "an optional property is placed after the one it follows" {
+  assert ordered("Stmt.if", ["k", "cond", "then", "pos"], ["else"]) == Ok(["cond", "then", "else", "pos"])
+  assert ordered("Stmt.switch", ["k", "cases", "pos"], ["tag"]) == Ok(["tag", "cases", "pos"])
+}
+
+test "an optional property without a placement is refused" {
+  assert ordered("Stmt.if", ["k", "cond", "then", "pos"], ["else", "label"]) == Err("Stmt.if: the optional property `label` has no placement in PLACEMENTS")
+  assert ordered("Stmt.if", ["k", "cond", "then", "pos"], []) == Err("Stmt.if: a placement of `else`, which is not an optional property of the schema")
+}
+
+test "a schema construct the generator does not know is refused" {
+  let object = parse(r#"{"title":"M","type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false,"required":["n"],"$defs":{}}"#)?
+  assert defs_of(object) == Err("#/properties/n: unsupported type `integer`")
+  let open = parse(r#"{"title":"M","type":"object","properties":{},"required":[],"$defs":{}}"#)?
+  assert defs_of(open) == Err("#: an object without `additionalProperties: false` cannot be read strictly")
+}
