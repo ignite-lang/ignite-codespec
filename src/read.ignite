@@ -543,11 +543,19 @@ fn is_wrapping_helper(decl: Json) -> Bool {
   params.len() == 2 && str(member(params[0], "type"), "kind") == "Int" && str(member(params[1], "type"), "kind") == "Int" && str(member(decl, "ret"), "kind") == "Int"
 }
 
-// The writer's helper `fn unordered<T>(m: T) -> T = m`: a loop over `unordered(m)` declares
-// that its order is not part of what the function does, which is cir/1's range over a map.
-fn is_unordered_helper(decl: Json) -> Bool {
+// The writer's helper `fn unordered<T>(m: T) -> T = m`, exactly the identity: a loop over
+// `unordered(m)` declares that its order is not part of what the function does, which is
+// cir/1's range over a map. Any other body (one with an effect, say) leaves the helper a
+// generic function, refused, and its loops plain map loops, refused.
+fn is_unordered_helper(d: Doc, decl: Json) -> Bool {
   let params = items(decl, "params")
-  str(decl, "qualifiedName") == "unordered" && items(decl, "typeParams").len() == 1 && params.len() == 1 && str(member(params[0], "type"), "kind") == "Param" && str(member(decl, "ret"), "kind") == "Param"
+  if str(decl, "qualifiedName") != "unordered" || items(decl, "typeParams").len() != 1 || params.len() != 1 || str(member(params[0], "type"), "kind") != "Param" || str(member(decl, "ret"), "kind") != "Param" {
+    return false
+  }
+  match sole_expr(d, decl) {
+    Some(body) => str(body, "kind") == "name" && str(body, "name") == str(params[0], "name")
+    None => false
+  }
 }
 
 // Whether the fn `decl` is the writer's form of a method with a pointer receiver: `fn T.m(r:
@@ -976,7 +984,7 @@ fn val(cx: Cx, i: Int) -> Result<Expr, Text> {
         return name_val(cx, node)
       }
       let receiver = expr_node(d, num(node, "receiver"))
-      let x = if cx.receiver != "" && str(receiver, "kind") == "name" && str(receiver, "name") == cx.receiver {
+      let x = if str(receiver, "kind") == "name" && is_receiver_name(cx, str(receiver, "name")) {
         match local_type(cx, cx.receiver) {
           Some(t) => Expr.Var(VarExpr { name = cx.receiver, t })
           None => return Err("the receiver " + cx.receiver + ", which is no local")
@@ -1047,7 +1055,7 @@ fn variant_path(cx: Cx, node: Json) -> Bool {
 fn name_val(cx: Cx, node: Json) -> Result<Expr, Text> {
   let name = str(node, "name")
   let t = member(node, "type")
-  if cx.receiver != "" && name == cx.receiver && str(node, "kind") == "name" {
+  if is_receiver_name(cx, name) && str(node, "kind") == "name" {
     return Err("the receiver " + name + " as a value: cir/1's receiver is a pointer, which Go shares where Ignite copies")
   }
   if str(node, "kind") == "field" {
@@ -1155,7 +1163,9 @@ fn fn_call(cx: Cx, qualified: Text, args: List<Expr>, t: Type) -> Result<Expr, T
   if has(cx.m.consumed, qualified) && last_segment(qualified) == "value" && args.len() == 1 {
     // `E.value(x)`, the writer's text of an enum over `string`: Go prints the value with `%s`.
     match find_enum(cx.m, cut(qualified, 0, qualified.len() - 6)) {
-      Some(e) => if e.under == Type.String {
+      Some(e) => if fn_decl(cx.d, e.name + ".String") != None || fn_decl(cx.d, e.name + ".Error") != None {
+        return Err("the value of the enum " + e.name + ", which has a method Go's %s calls in place of the value")
+      } else if e.under == Type.String {
         return Ok(Expr.Intrinsic(IntrinsicExpr { name = "sprintf", args = [lit_text("%s"), args[0]], t }))
       } else {
         return Err("the value of the enum " + e.name + " over Int: cir/1 converts only to a named type")
@@ -1292,10 +1302,35 @@ fn stmts(cx: Cx, list: List<Int>, tail: Bool) -> List<Stmt> {
   out
 }
 
+// A name bound inside a method returning its receiver that is the receiver's: what the method
+// returns under that name is then not the receiver, but cir/1 would return the receiver.
+const REBOUND: Text = "a binding inside a method returning its receiver of the receiver's name "
+
+// Whether `name` is the receiver of a method returning it, bound as the receiver and not by a
+// later statement.
+fn is_receiver_name(cx: Cx, name: Text) -> Bool = cx.receiver != "" && name == cx.receiver && match local_type(cx, name) {
+  Some(Type.Ptr(_)) => true
+  _ => false
+}
+
 // One statement as cir/1 and the context after it, or why it has none.
 fn stmt(cx: Cx, node: Json, tail: Bool) -> Result<(List<Stmt>, Cx), Text> {
   let d = cx.d
   let at = pos(d, node)
+  if cx.receiver != "" {
+    var names = bound_names(d, node)
+    if str(node, "kind") == "for" {
+      names.push(str(node, "name"))
+    }
+    if str(node, "kind") == "forPattern" {
+      for item in indexes(pattern_node(d, num(node, "pattern")), "items") {
+        names.push(str(pattern_node(d, item), "name"))
+      }
+    }
+    if has(names, cx.receiver) {
+      return Err(REBOUND + cx.receiver)
+    }
+  }
   match str(node, "kind") {
     "let" => {
       let name = str(node, "name")
@@ -1541,7 +1576,7 @@ fn tail_expr(cx: Cx, e: Int, at: Text) -> Result<List<Stmt>, Text> {
     "match" => Ok([switch_stmt(cx, node, true, at)?])
     "block" => Err("a block as a value: cir/1 has no block statement")
     "return" => return_stmts(cx, num(node, "value"), at)
-    "name" => if cx.receiver != "" && str(node, "name") == cx.receiver && cx.results.is_empty() && cx.shape == Shape.Plain {
+    "name" => if is_receiver_name(cx, str(node, "name")) && cx.results.is_empty() && cx.shape == Shape.Plain {
       Ok([])
     } else {
       return_stmts(cx, e, at)
@@ -1604,6 +1639,9 @@ fn switch_stmt(cx: Cx, node: Json, tail: Bool, at: Text) -> Result<Stmt, Text> {
     } else if kind == "binding" {
       if str(scrutinee, "kind") != "name" {
         return Err("a `match` arm that binds a value other than a variable")
+      }
+      if cx.receiver != "" && str(p, "name") == cx.receiver {
+        return Err(REBOUND + cx.receiver)
       }
       if cx.writes && holds_container(cx.m, tag_type, []) {
         return Err(SHARED)
@@ -1705,7 +1743,7 @@ fn unthread(cx: Cx, e: Int) -> Result<Int, Text> {
   if cx.receiver == "" {
     return Ok(e)
   }
-  let is_receiver = |i: Int| i >= 0 && str(expr_node(cx.d, i), "kind") == "name" && str(expr_node(cx.d, i), "name") == cx.receiver
+  let is_receiver = |i: Int| i >= 0 && str(expr_node(cx.d, i), "kind") == "name" && is_receiver_name(cx, str(expr_node(cx.d, i), "name"))
   if cx.results.is_empty() && cx.shape == Shape.Plain {
     if is_receiver(e) {
       return Ok(-1)
@@ -1819,6 +1857,9 @@ fn assign(cx: Cx, node: Json, at: Text) -> Result<Stmt, Text> {
     Some(t) => t
     None => return Err("a write to " + base + ", which is no local")
   }
+  if is_receiver_name(cx, base) && items(target, "fields").is_empty() {
+    return Err("an assignment to the receiver " + base + " as a whole: cir/1's receiver is a pointer, which Go would rebind where Ignite replaces the value")
+  }
   var place = Expr.Var(VarExpr { name = base, t = base_type })
   var current = base_type
   for f in items(target, "fields") {
@@ -1930,7 +1971,7 @@ fn translate(d: Doc) -> Result<CirModule, Text> {
         }
       }
     }
-    if str(decl, "kind") == "fn" && (is_wrapping_helper(decl) || is_unordered_helper(decl)) {
+    if str(decl, "kind") == "fn" && (is_wrapping_helper(decl) || is_unordered_helper(d, decl)) {
       m.consumed.push(str(decl, "qualifiedName"))
     }
     if str(decl, "kind") == "fn" && is_threaded(d, decl) {

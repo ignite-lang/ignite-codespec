@@ -145,7 +145,17 @@ capability resources; closures until `cir/1` has a node for them.
   write is refused (Go would share the pointer where Ignite copies), and a call of such a method
   inside the module is refused. `enum Error`'s `V(V)` of a record `V` with `fn V.error` is the
   error type `V`: `Error.V(v)` is `v` used as an error and `V.error` is the method `V.Error`.
-  `E.V` is the constant `V`; `E.value(x)` of an enum over `Text` is `sprintf("%s", x)`.
+  `E.V` is the constant `V`; `E.value(x)` of an enum over `Text` is `sprintf("%s", x)`, refused
+  when `E` has a method `String` or `Error`, which Go's `%s` calls in place of the value.
+- The receiver of such a method is matched by its binding: a nested `let`, loop variable or
+  `match` binding of the receiver's name is refused, as is an assignment to the whole
+  receiver (`r = other`), which Go would make a rebinding of a local.
+- `unordered` is the writer's helper only when its body is exactly the identity; any other
+  body leaves its loops plain map loops, refused. A hand-written identity `unordered(m)` is
+  accepted as its author's declaration that the order does not matter.
+- By design: a copy-and-update method `var p = p; ..; p` is read as a pointer method. An Ignite
+  caller outside the module that keeps the original value sees no change; a Go caller of the
+  cir/1 method does. Calls of such methods inside the module are refused.
 - Exception, stated: Ignite's `Int` operators trap on overflow where cir/1's wrap. The two
   differ only on a program that traps, which is written as one that does not (`AGENTS.md`).
 - Known gap: the typed document resolves aliases, so a newtype's uses read as its underlying
