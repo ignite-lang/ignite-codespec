@@ -61,6 +61,29 @@ and a reason; nothing is approximated. "Verified" rows cite the Ignite contract 
 | a `(T, bool)` the `comma_ok` fact marks | `Option<T>` | inferred |
 | `foreign` | refused, with its source text and reason | codespec rule |
 
+### As written (C1, `src/write.ignite`)
+
+- Output: `codespec-write-ignite OUT` writes `OUT/<module>.ignite` and `OUT/refusals.json`, and
+  one JSON line per refusal on stderr. `OUT` is relative to the working directory or absolute
+  without a symbolic link in it (`std.fs` refuses links).
+- Package: the module is `package codespec.<module>`, so it is the sibling `<module>.ignite` of
+  a program in `package codespec`. The adapter protocol passes no package, so the writer derives
+  it from the `cir/1` module name, which must be a lowercase Ignite name (else exit 1).
+- A method whose pointer receiver `read_only` does not list returns the receiver after the call
+  first: `fn Ledger.place(l: Ledger, ..) -> (Ledger, Result<OrderID, Error>)`; one without
+  results returns the receiver alone. Every method is an associated fn called `T.m(x, ..)`.
+- A newtype is an alias (`type OrderID = Text`); an enum gets `T.value(v)`, the value the source
+  gives each variant; `error` is the module's `enum Error` with `Error.text(e)`.
+- `int` arithmetic: `+`, `-`, `++`, `--` go through `wrapping_add` and `wrapping_sub`, emitted
+  when used, because Go's integers wrap and Ignite's fail; `*`, `/`, `%` are refused.
+- A refusal names the layout key (`type:Service`, `func:Service.Audit`), the position of the
+  construct and the reason. A refused type takes every declaration that mentions it, a refused
+  function every caller. `cir/1` gives a struct field no position, so a field's refusal carries
+  its struct's (`orders.go:52` for the field on line 53).
+- Checked by `task writer`: the ledger's output equals `examples/ledger/out/ignite/` and runs
+  under `examples/ledger/drivers/ignite-out/` in the harness; orders' refusals equal
+  `examples/orders-refusals.expected.json`.
+
 ## 4. Ignite → codespec (the reader)
 
 An Ignite program cannot parse and type Ignite source itself. The compiler provides it: ignite

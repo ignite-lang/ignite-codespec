@@ -13,6 +13,51 @@ tasks:
       - for f in $(find src tools -name '*.ignite' 2>/dev/null); do {{.IGNITE}} check "$f" || exit 1; done
       - task: cir-model
       - task: harness
+      - task: writer
+
+  writer:
+    desc: The writer's inline tests pass, its output of the ledger and orders examples equals the checked-in output and checks silently
+    cmds:
+      - task: test-writer
+      - task: write-ledger
+      - task: write-orders
+
+  adapters:
+    desc: Build codespec-write-ignite into target/adapters, the --adapters directory of codespec write --lang ignite
+    run: once
+    cmds:
+      - '{{.IGNITE}} build src/write.ignite --out target/ignite/write'
+      - mkdir -p target/adapters
+      - cp target/ignite/write/bin/codespec-write-ignite target/adapters/codespec-write-ignite
+
+  test-writer:
+    desc: Run the inline tests of the writer
+    cmds:
+      - '{{.IGNITE}} test src/write.ignite --out target/ignite-test-writer'
+
+  write-ledger:
+    desc: Read, pass and write the ledger; the output equals examples/ledger/out/ignite and checks without a diagnostic
+    cmds:
+      - task: adapters
+      - mkdir -p target/write
+      - '{{.CODESPEC}} read --lang go examples/ledger/source --out target/write/ledger.cir.json --adapters {{.ADAPTERS}}'
+      - '{{.CODESPEC}} pass target/write/ledger.cir.json --out target/write/ledger.facts.json'
+      - '{{.CODESPEC}} write --lang ignite target/write/ledger.facts.json --out target/write/ledger --adapters target/adapters'
+      - cmp target/write/ledger/ledger.ignite examples/ledger/out/ignite/ledger.ignite
+      - cmp target/write/ledger/refusals.json examples/ledger/out/ignite/refusals.json
+      - test -z "$({{.IGNITE}} check examples/ledger/out/ignite/ledger.ignite 2>&1)"
+      - test -z "$({{.IGNITE}} check examples/ledger/drivers/ignite-out/driver.ignite 2>&1)"
+
+  write-orders:
+    desc: Read, pass and write codespec's orders example; its refusals equal examples/orders-refusals.expected.json and the written rest checks without a diagnostic
+    cmds:
+      - task: adapters
+      - mkdir -p target/write
+      - '{{.CODESPEC}} read --lang go {{.CODESPEC_DIR}}/examples/orders/source --out target/write/orders.cir.json --adapters {{.ADAPTERS}}'
+      - '{{.CODESPEC}} pass target/write/orders.cir.json --out target/write/orders.facts.json'
+      - '{{.CODESPEC}} write --lang ignite target/write/orders.facts.json --out target/write/orders --adapters target/adapters'
+      - cmp target/write/orders/refusals.json examples/orders-refusals.expected.json
+      - test -z "$({{.IGNITE}} check target/write/orders/orders.ignite 2>&1)"
 
   cir-model:
     desc: The cir/1 model is current, every example document round trips, the inline tests pass

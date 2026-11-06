@@ -1,0 +1,117 @@
+package codespec
+
+import std.text.{lines, split}
+import codespec.ledger.{Ledger, Order, Event, EventKind, Error, Status, new}
+
+// The harness driver of the ledger as `codespec-write-ignite` writes it: reads a codespec
+// harness trace on standard input and prints one line per command result, then one line per
+// event the call recorded, drained from the ledger in order (codespec's crates/harness, the
+// orders format). The ledger is the sibling module `codespec.ledger`: `ledger.ignite` beside
+// this file links to the checked-in output `examples/ledger/out/ignite/ledger.ignite`.
+//
+// The written API follows the writer's rules: a method whose receiver it writes returns the
+// receiver after the call first (`Ledger.place(l, ..) -> (Ledger, Result<OrderID, Error>)`),
+// a `fallible` method returns a `Result` over `Error`, a `comma_ok` one an `Option`.
+
+type Driver {
+  executable: Text
+}
+
+fn Driver.main(self: Driver) -> Result<Unit, IoError> {
+  let trace = read_all()?.to_text()
+  var out: List<Text> = []
+  var ledger = new()
+  var started = false
+  var number = 0
+  for line in trace.lines() {
+    number = number + 1
+    let f = line.split(" ")
+    let command = f[0]
+    if command != "new" && !started {
+      return fail(number, "command before new")
+    }
+    if command == "new" && f.len() == 1 {
+      ledger = new()
+      started = true
+      out.push("new")
+    } else if command == "place" && f.len() == 4 {
+      let total = match Int.parse(f[2]) {
+        Some(n) => n
+        None => return fail(number, "total {f[2]} is not an int64")
+      }
+      let gift = match f[3] {
+        "true" => true
+        "false" => false
+        _ => return fail(number, "gift {f[3]} is not a bool")
+      }
+      let (next, placed) = Ledger.place(ledger, f[1], total, gift)
+      ledger = next
+      out.push(match placed {
+        Ok(id) => "place ok {id}"
+        Err(error) => "place err {Error.text(error)}"
+      })
+    } else if command == "pay" && f.len() == 2 {
+      let (next, paid) = Ledger.pay(ledger, f[1])
+      ledger = next
+      out.push(result("pay", paid))
+    } else if command == "ship" && f.len() == 3 {
+      let (next, shipped) = Ledger.ship(ledger, f[1], f[2])
+      ledger = next
+      out.push(result("ship", shipped))
+    } else if command == "cancel" && f.len() == 2 {
+      let (next, cancelled) = Ledger.cancel(ledger, f[1])
+      ledger = next
+      out.push(result("cancel", cancelled))
+    } else if command == "get" && f.len() == 2 {
+      out.push(match Ledger.get(ledger, f[1]) {
+        Some(o) => "get found {order(o)}"
+        None => "get missing"
+      })
+    } else if command == "pending" && f.len() == 1 {
+      let pending = Ledger.pending_orders(ledger)
+      out.push("pending {pending.len()}" + pending.map(|o| " | " + order(o)).join(""))
+    } else {
+      return fail(number, "unknown command {line.debug()}")
+    }
+    let (drained, events) = Ledger.drain(ledger)
+    ledger = drained
+    for e in events {
+      out.push(event(e))
+    }
+  }
+  Stdout.write_all(out.map(|l| l + "\n").join("").to_bytes())
+}
+
+fn read_all() -> Result<Bytes, IoError> requires [stdin.read] {
+  var data = Bytes.empty()
+  loop {
+    match Stdin.read(65536)? {
+      Eof => return Ok(data)
+      Data(more) => data.append(more)
+    }
+  }
+}
+
+fn result(command: Text, outcome: Result<Unit, Error>) -> Text = match outcome {
+  Ok(_) => "{command} ok"
+  Err(error) => "{command} err {Error.text(error)}"
+}
+
+fn order(o: Order) -> Text =
+  "id={o.id} customer={o.customer} total={o.total} status={Status.value(o.status)} tracking={o.tracking} gift={o.gift}"
+
+fn event(e: Event) -> Text = match e.kind {
+  EventKind.OrderPlaced => "event OrderPlaced id={e.id} customer={e.customer} total={e.total}"
+  EventKind.OrderPaid => "event OrderPaid id={e.id}"
+  EventKind.OrderShipped => "event OrderShipped id={e.id} tracking={e.tracking}"
+  EventKind.OrderCancelled => "event OrderCancelled id={e.id}"
+}
+
+fn fail(number: Int, reason: Text) -> Result<Unit, IoError> =
+  Err(IoError.new("driver: trace line {number}: {reason}").with_exit_code(2))
+
+system Harness {
+  component driver: Driver {
+    executable = "ledger-ignite"
+  }
+}
