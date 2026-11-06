@@ -1,0 +1,2600 @@
+package codespec
+
+import std.json.{Json, parse, get, encode, quote}
+import std.fs.{write_text_file, join_path}
+import std.text.{split, contains, ends_with, is_digit}
+import std.io.IoError
+import codespec.cir.{
+  CirModule, Facts, Func, Param, Field, Stmt, Expr, Type, TypeDecl, IntWidth, ChanDir, Case,
+  ReadError, describe
+}
+
+// `codespec-write-ignite`: reads one cir/1 module, with the facts of `codespec pass`, on
+// standard input and writes it as one Ignite module into the output directory named by its
+// one argument: `<name>.ignite` and `refusals.json`, and one JSON line per refusal on
+// standard error. Every mapping is read off the module and its facts (`docs/design.md`
+// section 3); a construct without a mapping is refused with its position and reason, never
+// approximated. A refused type leaves out every declaration that mentions it, a refused
+// function every function that calls it; the writer still exits 0. A module without facts,
+// or one whose names cannot be written at all, is refused whole: exit 1, nothing written.
+//
+// | cir/1 | Ignite | decided by |
+// |---|---|---|
+// | module `m` | `package codespec.m`, the sibling `m.ignite` of a program in `package codespec` | — |
+// | `int` (`platform`, 64, signed) | `Int`; `+`, `-`, `++`, `--` through `wrapping_add` and `wrapping_sub`, which wrap as Go does | — |
+// | other integer widths, `*`, `/`, `%`, bit operators | refused | — |
+// | `bool`, `string`, `unit` | `Bool`, `Text`, `Unit` | — |
+// | `slice`, `map` | `List<T>`, `Map<K, V>` (keys `Int`, `Bool`, `Text`, an enum or a newtype of those) | — |
+// | `struct`, `newtype`, `enum`, `union` | record, alias, enum with `T.value`, enum with payloads | — |
+// | `*T`, `T` not `shared` | `T`: a receiver or a result is the value | `shared` |
+// | `*T`, `T` `shared`; `chan`, `send`, `any` | refused: Ignite has no shared mutable reference and no channel | `shared` |
+// | method whose pointer receiver is not `read_only` | `fn T.m(r: T, ..) -> (T, R)`: the receiver after the call comes first | `read_only` |
+// | last result `error`, function `fallible` | `Result<T, Error>`; `enum Error` holds the sentinels, the error structs and `Msg(Text)` for `errorf` | `fallible` |
+// | `(T, bool)`, function `comma_ok` | `Option<T>` | `comma_ok` |
+// | `lookup_else` | `let x = match m.get(k) { Some(x) => x, None => { .. return } }` | — |
+// | `for range` over a map listed in `unordered_iteration` | `for (k, v) in m` in key order | `unordered_iteration` |
+// | `sprintf`, `errorf` with `%s %v %d %t %%` | text joined with `+`; a named type through `displays` | `displays` |
+// | `foreign` | refused with the reader's reason | — |
+//
+// Go shares a slice or map bound to a second name; Ignite copies it. Such a binding is written
+// only in a function that writes no slice or map element and appends to none, so that neither
+// name can see a write through the other.
+//
+// This file is a program file (package `codespec`) importing the sibling `codespec.cir`, as
+// `cir_json.ignite` is: `ignite test` runs no test of a sibling module.
+
+// ---- the executable ----------------------------------------------------------------------
+
+type WriteIgnite {
+  command_line: CommandLine
+  here: Directory
+  root: Directory
+  executable: Text
+}
+
+fn WriteIgnite.main(self: WriteIgnite) -> Result<Unit, IoError> {
+  let arguments = self.command_line.arguments()
+  if arguments.len() != 1 {
+    log("usage: codespec-write-ignite <out dir>")
+    Process.exit(2)?
+    return Ok(())
+  }
+  let text = read_all()?.to_text()
+  let module = match read(text) {
+    Ok(module) => module
+    Err(error) => {
+      log("codespec-write-ignite: " + error.describe())
+      Process.exit(1)?
+      return Ok(())
+    }
+  }
+  let written = match write(module) {
+    Ok(written) => written
+    Err(reason) => {
+      log("codespec-write-ignite: " + reason)
+      Process.exit(1)?
+      return Ok(())
+    }
+  }
+  var out = arguments[0]
+  while out.len() > 1 && ends_with(out, "/") {
+    out = cut(out, 0, out.len() - 1)
+  }
+  if out.starts_with("/") {
+    store(self.root, cut(out, 1, out.len()), module.name, written)?
+  } else {
+    store(self.here, out, module.name, written)?
+  }
+  for r in written.refusals {
+    log(refusal_line(r))
+  }
+  Ok(())
+}
+
+fn store(files: Directory, dir: Text, name: Text, written: Written) -> Result<Unit, IoError> requires [files.write] {
+  files.create_directory(dir)?
+  write_text_file(files, join_path(dir, name + ".ignite"), written.source)?
+  write_text_file(files, join_path(dir, "refusals.json"), refusals_json(written.refusals))
+}
+
+fn read_all() -> Result<Bytes, IoError> requires [stdin.read] {
+  var data = Bytes.empty()
+  loop {
+    match Stdin.read(65536)? {
+      Eof => return Ok(data)
+      Data(more) => data.append(more)
+    }
+  }
+}
+
+system CodespecWriteIgnite {
+  resource command_line: CommandLine
+  resource here: Directory { path = "." }
+  resource root: Directory { path = "/" }
+
+  component writer: WriteIgnite {
+    command_line = command_line
+    here = here
+    root = root
+    executable = "codespec-write-ignite"
+  }
+}
+
+// The module of the cir/1 document `text`, read strictly (`cir_json.ignite`'s `read`).
+fn read(text: Text) -> Result<CirModule, ReadError> {
+  let value = match parse(text) {
+    Ok(value) => value
+    Err(e) => return Err(ReadError { path = "$", message = "not JSON: " + e.message + " at byte " + e.offset.to_text() })
+  }
+  match get(value, "format") {
+    Some(Json.Str(format)) => {
+      if format != "cir/1" {
+        return Err(ReadError { path = "$.format", message = "format is `" + format + "`, this writer reads `cir/1`" })
+      }
+    }
+    Some(_) => return Err(ReadError { path = "$.format", message = "expected a string" })
+    Option.None => return Err(ReadError { path = "$", message = "missing field `format`" })
+  }
+  CirModule.from_json(value, "$")
+}
+
+// ---- results -----------------------------------------------------------------------------
+
+// A declaration left out of the output: its layout key (`type:T`, `func:K`), the position
+// of the construct that has no mapping and the reason.
+type Refusal {
+  name: Text
+  pos: Text
+  reason: Text
+}
+
+// Why a statement cannot be written.
+type Refuse {
+  pos: Text
+  reason: Text
+}
+
+type Written {
+  source: Text
+  refusals: List<Refusal>
+}
+
+fn refusal_json(r: Refusal) -> Json = Json.Object([("name", Json.Str(r.name)), ("pos", Json.Str(r.pos)), ("reason", Json.Str(r.reason))])
+
+fn refusal_line(r: Refusal) -> Text = encode(refusal_json(r))
+
+// `refusals` as serde_json's pretty printer writes them, as codespec-write-rust does.
+fn refusals_json(refusals: List<Refusal>) -> Text {
+  if refusals.is_empty() {
+    return "[]\n"
+  }
+  let items = refusals.map(|r| "  " + r"{" + "\n    \"name\": " + quote(r.name) + ",\n    \"pos\": " + quote(r.pos) + ",\n    \"reason\": " + quote(r.reason) + "\n  " + r"}")
+  "[\n" + items.join(",\n") + "\n]\n"
+}
+
+// ---- text and names ----------------------------------------------------------------------
+
+fn has(names: List<Text>, name: Text) -> Bool {
+  for n in names {
+    if n == name {
+      return true
+    }
+  }
+  false
+}
+
+fn cut(text: Text, start: Int, end: Int) -> Text = text.to_bytes().slice(start, end).to_text()
+
+fn is_upper(b: Byte) -> Bool = b >= b'A' && b <= b'Z'
+
+fn is_lower(b: Byte) -> Bool = b >= b'a' && b <= b'z'
+
+const KEYWORDS: List<Text> = [
+  "package", "import", "type", "enum", "fn", "const", "protocol", "test", "system", "resource",
+  "component", "contract", "policy", "assembly", "let", "var", "if", "else", "match", "while",
+  "loop", "for", "in", "break", "continue", "return", "requires", "spawn", "assert", "true",
+  "false", "await", "satisfies", "self"
+]
+
+// Type and variant names the output cannot declare: Ignite's builtins and the names the writer
+// declares itself.
+const TAKEN_TYPES: List<Text> = [
+  "Int", "Byte", "Bool", "Text", "Unit", "List", "Bytes", "Map", "Option", "Result", "IoError",
+  "Duration", "ByteSize", "Ratio", "TcpListener", "TcpStream", "PipeStream", "Store", "Input",
+  "Ref", "Signal", "SystemRef", "Protocol", "Module", "Exposure", "Stdin", "Stdout", "Process",
+  "Clock", "Pipe", "Directory", "Launcher", "ChildProcess", "Entropy", "Setting", "CommandLine",
+  "Some", "None", "Ok", "Err", "Data", "Eof", "Error"
+]
+
+// Function names the output cannot declare: Ignite's builtin functions and the helpers.
+const TAKEN_FNS: List<Text> = ["log", "module", "wrapping_add", "wrapping_sub"]
+
+// `OrderID` → `order_id`, `PendingOrders` → `pending_orders`, `HTTPServer` → `http_server`.
+fn snake(name: Text) -> Text {
+  let cs = name.to_bytes()
+  var out = Bytes.empty()
+  var i = 0
+  while i < cs.len() {
+    let c = cs[i]
+    if is_upper(c) {
+      if i > 0 {
+        let p = cs[i - 1]
+        let boundary = if is_lower(p) || is_digit(p) {
+          true
+        } else if is_upper(p) {
+          i + 1 < cs.len() && is_lower(cs[i + 1])
+        } else {
+          false
+        }
+        if boundary && !(out.len() > 0 && out[out.len() - 1] == b'_') {
+          out.push(b'_')
+        }
+      }
+      out.push(c - b'A' + b'a')
+    } else {
+      out.push(c)
+    }
+    i = i + 1
+  }
+  out.to_text()
+}
+
+// `order_id` → `OrderId`, `ledger` → `Ledger`; a name that starts uppercase and has no `_`
+// stays as it is.
+fn upper_camel(name: Text) -> Text {
+  let cs = name.to_bytes()
+  if !contains(name, "_") && cs.len() > 0 && is_upper(cs[0]) {
+    return name
+  }
+  var out = Bytes.empty()
+  for part in name.split("_") {
+    let ps = part.to_bytes()
+    var i = 0
+    while i < ps.len() {
+      if i == 0 && is_lower(ps[0]) {
+        out.push(ps[0] - b'a' + b'A')
+      } else {
+        out.push(ps[i])
+      }
+      i = i + 1
+    }
+  }
+  out.to_text()
+}
+
+fn escaped(name: Text) -> Text = if has(KEYWORDS, name) { name + "_" } else { name }
+
+// A function, method, field, parameter or local.
+fn value_ident(name: Text) -> Text = if name == "_" { "_" } else { escaped(snake(name)) }
+
+fn type_ident(name: Text) -> Text = upper_camel(name)
+
+fn const_ident(name: Text) -> Text = to_upper(snake(name))
+
+fn to_upper(text: Text) -> Text {
+  var out = Bytes.empty()
+  for b in text.to_bytes() {
+    out.push(if is_lower(b) { b - b'a' + b'A' } else { b })
+  }
+  out.to_text()
+}
+
+fn comment(doc: Text) -> List<Text> {
+  if doc.is_empty() {
+    return []
+  }
+  doc.split("\n").map(|l| if l.is_empty() { "//" } else { "// " + l })
+}
+
+fn indent(lines: List<Text>) -> List<Text> = lines.map(|l| if l.is_empty() { l } else { "  " + l })
+
+fn hex_digit(n: Int) -> Byte = if n < 10 { digit_byte(n) } else { b'a' + digit_byte(n - 10) - b'0' }
+
+fn digit_byte(n: Int) -> Byte = match n.to_byte() {
+  Some(b) => b'0' + b
+  None => b'0'
+}
+
+fn hex(n: Int) -> Text {
+  if n < 16 {
+    return Bytes.of([hex_digit(n)]).to_text()
+  }
+  hex(n / 16) + Bytes.of([hex_digit(n % 16)]).to_text()
+}
+
+// `text` as an Ignite string literal: `"`, `\`, `{`, `}` and control characters escaped.
+fn ignite_string(text: Text) -> Text {
+  var out = "\""
+  var plain = Bytes.empty()
+  for b in text.to_bytes() {
+    let escape = match b {
+      b'"' => "\\\""
+      b'\\' => "\\\\"
+      b'{' => r"{{"
+      b'}' => r"}}"
+      b'\n' => "\\n"
+      b'\r' => "\\r"
+      b'\t' => "\\t"
+      _ => if b.to_int() < 32 || b.to_int() == 127 { "\\u" + r"{" + hex(b.to_int()) + r"}" } else { "" }
+    }
+    if escape.is_empty() {
+      plain.push(b)
+    } else {
+      out = out + plain.to_text() + escape
+      plain = Bytes.empty()
+    }
+  }
+  out + plain.to_text() + "\""
+}
+
+// ---- Go literals -------------------------------------------------------------------------
+
+fn digit_of(b: Byte) -> Option<Int> {
+  if is_digit(b) {
+    return Some((b - b'0').to_int())
+  }
+  if b >= b'a' && b <= b'f' {
+    return Some((b - b'a').to_int() + 10)
+  }
+  if b >= b'A' && b <= b'F' {
+    return Some((b - b'A').to_int() + 10)
+  }
+  None
+}
+
+// The value of a Go integer literal in `radix`, or why it has none as an `Int`.
+fn digits_value(digits: Bytes, radix: Int, literal: Text) -> Result<Int, Text> {
+  if digits.is_empty() {
+    return Err("integer literal " + literal)
+  }
+  var v = 0
+  for b in digits {
+    let d = match digit_of(b) {
+      Some(d) => d
+      None => return Err("integer literal " + literal)
+    }
+    if d >= radix {
+      return Err("integer literal " + literal)
+    }
+    if v > (9223372036854775807 - d) / radix {
+      return Err("integer literal " + literal + " overflows Int")
+    }
+    v = v * radix + d
+  }
+  Ok(v)
+}
+
+// The value of the Go integer literal `literal`: decimal, `0x`, `0o`, `0b` or a leading `0`.
+fn go_int(literal: Text) -> Result<Int, Text> {
+  var digits = Bytes.empty()
+  for b in literal.to_bytes() {
+    if b != b'_' {
+      digits.push(b)
+    }
+  }
+  let n = digits.len()
+  if n > 2 && digits[0] == b'0' {
+    let p = digits[1]
+    if p == b'x' || p == b'X' {
+      return digits_value(digits.slice(2, n), 16, literal)
+    }
+    if p == b'o' || p == b'O' {
+      return digits_value(digits.slice(2, n), 8, literal)
+    }
+    if p == b'b' || p == b'B' {
+      return digits_value(digits.slice(2, n), 2, literal)
+    }
+  }
+  if n > 1 && digits[0] == b'0' {
+    return digits_value(digits.slice(1, n), 8, literal)
+  }
+  digits_value(digits, 10, literal)
+}
+
+// The UTF-8 bytes of the scalar value `cp`.
+fn utf8(cp: Int) -> Option<Bytes> {
+  if cp < 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343) {
+    return None
+  }
+  if cp < 128 {
+    return Some(Bytes.of([byte(cp)]))
+  }
+  if cp < 2048 {
+    return Some(Bytes.of([byte(192 + cp / 64), byte(128 + cp % 64)]))
+  }
+  if cp < 65536 {
+    return Some(Bytes.of([byte(224 + cp / 4096), byte(128 + cp / 64 % 64), byte(128 + cp % 64)]))
+  }
+  Some(Bytes.of([byte(240 + cp / 262144), byte(128 + cp / 4096 % 64), byte(128 + cp / 64 % 64), byte(128 + cp % 64)]))
+}
+
+fn byte(n: Int) -> Byte = match n.to_byte() {
+  Some(b) => b
+  None => b'0'
+}
+
+// The value of `count` hex (or octal) digits of `bytes` from `at`.
+fn escape_value(bytes: Bytes, at: Int, count: Int, radix: Int) -> Option<Int> {
+  if at + count > bytes.len() {
+    return None
+  }
+  var v = 0
+  var i = 0
+  while i < count {
+    let d = match digit_of(bytes[at + i]) {
+      Some(d) => d
+      None => return None
+    }
+    if d >= radix {
+      return None
+    }
+    v = v * radix + d
+    i = i + 1
+  }
+  Some(v)
+}
+
+// The UTF-8 bytes of the `count` hex digits of `bytes` from `at`.
+fn code_point(bytes: Bytes, at: Int, count: Int) -> Option<Bytes> = match escape_value(bytes, at, count, 16) {
+  Some(cp) => utf8(cp)
+  None => None
+}
+
+// The text of a Go string literal, interpreted (`"…"`) or raw (backquoted).
+fn go_string(literal: Text) -> Result<Text, Text> {
+  let bad = "string literal " + literal
+  let b = literal.to_bytes()
+  let n = b.len()
+  if n >= 2 && b[0] == b'`' && b[n - 1] == b'`' {
+    var raw = Bytes.empty()
+    for c in b.slice(1, n - 1) {
+      if c != b'\r' {
+        raw.push(c)
+      }
+    }
+    return Ok(raw.to_text())
+  }
+  if n < 2 || b[0] != b'"' || b[n - 1] != b'"' {
+    return Err(bad)
+  }
+  var out = Bytes.empty()
+  var i = 1
+  while i < n - 1 {
+    let c = b[i]
+    if c != b'\\' {
+      out.push(c)
+      i = i + 1
+      continue
+    }
+    if i + 1 >= n - 1 {
+      return Err(bad)
+    }
+    let e = b[i + 1]
+    let simple: Option<Byte> = match e {
+      b'a' => Some(7)
+      b'b' => Some(8)
+      b'f' => Some(12)
+      b'n' => Some(10)
+      b'r' => Some(13)
+      b't' => Some(9)
+      b'v' => Some(11)
+      b'\\' => Some(92)
+      b'"' => Some(34)
+      _ => None
+    }
+    match simple {
+      Some(s) => {
+        out.push(s)
+        i = i + 2
+        continue
+      }
+      None => {}
+    }
+    if e == b'x' {
+      match escape_value(b, i + 2, 2, 16) {
+        Some(v) => out.push(byte(v))
+        None => return Err(bad)
+      }
+      i = i + 4
+    } else if e >= b'0' && e <= b'7' {
+      match escape_value(b, i + 1, 3, 8) {
+        Some(v) => {
+          if v > 255 {
+            return Err(bad)
+          }
+          out.push(byte(v))
+        }
+        None => return Err(bad)
+      }
+      i = i + 4
+    } else if e == b'u' || e == b'U' {
+      let count = if e == b'u' { 4 } else { 8 }
+      match code_point(b, i + 2, count) {
+        Some(bytes) => out.append(bytes)
+        None => return Err(bad)
+      }
+      i = i + 2 + count
+    } else {
+      return Err(bad)
+    }
+  }
+  let text = out.to_text()
+  if text.to_bytes() != out {
+    return Err(bad + " is not UTF-8")
+  }
+  Ok(text)
+}
+
+// ---- the module --------------------------------------------------------------------------
+
+// The module, its facts and the declarations refused so far (`type:T`, `func:K`).
+type W {
+  m: CirModule
+  facts: Facts
+  refused: List<Text>
+}
+
+enum Shape {
+  Plain
+  Fallible
+  CommaOk
+}
+
+fn decl_name(d: TypeDecl) -> Text = match d {
+  TypeDecl.Struct(s) => s.name
+  TypeDecl.Newtype(s) => s.name
+  TypeDecl.Enum(s) => s.name
+  TypeDecl.Union(s) => s.name
+}
+
+fn decl_pos(d: TypeDecl) -> Text = match d {
+  TypeDecl.Struct(s) => s.pos
+  TypeDecl.Newtype(s) => s.pos
+  TypeDecl.Enum(s) => s.pos
+  TypeDecl.Union(s) => s.pos
+}
+
+fn decl(w: W, name: Text) -> Option<TypeDecl> {
+  for d in w.m.types {
+    if decl_name(d) == name {
+      return Some(d)
+    }
+  }
+  None
+}
+
+fn recv_type_name(t: Type) -> Text = match t {
+  Type.Named(n) => n.name
+  Type.Ptr(p) => match p.elem {
+    Type.Named(n) => n.name
+    _ => ""
+  }
+  _ => ""
+}
+
+fn func_key(f: Func) -> Text = match f.recv {
+  Some(r) => recv_type_name(r.t) + "." + f.name
+  None => f.name
+}
+
+fn method(w: W, key: Text) -> Option<Func> {
+  for f in w.m.funcs {
+    if f.recv != None && func_key(f) == key {
+      return Some(f)
+    }
+  }
+  None
+}
+
+fn function(w: W, name: Text) -> Option<Func> {
+  for f in w.m.funcs {
+    if f.recv == None && f.name == name {
+      return Some(f)
+    }
+  }
+  None
+}
+
+fn shared(w: W, t: Type) -> Bool = match t {
+  Type.Ptr(p) => match p.elem {
+    Type.Named(n) => has(w.facts.shared, n.name)
+    _ => false
+  }
+  _ => false
+}
+
+fn displays(w: W, name: Text) -> Bool = has(w.facts.displays, name)
+
+fn read_only(w: W, key: Text) -> Bool = has(w.facts.read_only, key)
+
+// Whether a call of `key` returns the receiver after the call: a method with a pointer
+// receiver that `read_only` does not list.
+fn threads(w: W, key: Text) -> Bool = match method(w, key) {
+  Some(f) => match f.recv {
+    Some(r) => match r.t {
+      Type.Ptr(_) => !read_only(w, key)
+      _ => false
+    }
+    None => false
+  }
+  None => false
+}
+
+// Whether `name` is a struct with the method `Error() string`.
+fn is_error_struct(w: W, name: Text) -> Bool {
+  match decl(w, name) {
+    Some(TypeDecl.Struct(_)) => {}
+    _ => return false
+  }
+  match method(w, name + ".Error") {
+    Some(f) => f.params.is_empty() && f.results == [Type.String]
+    None => false
+  }
+}
+
+// The type as Go spells it, for reasons.
+fn type_name(t: Type) -> Text = match t {
+  Type.Int(i) => {
+    let w = match i.width {
+      IntWidth.Platform => ""
+      IntWidth.V8 => "8"
+      IntWidth.V16 => "16"
+      IntWidth.V32 => "32"
+      IntWidth.V64 => "64"
+    }
+    (if i.signed { "int" } else { "uint" }) + w
+  }
+  Type.Bool => "bool"
+  Type.String => "string"
+  Type.Error => "error"
+  Type.Any => "any"
+  Type.Unit => "unit"
+  Type.Named(n) => n.name
+  Type.Ptr(p) => "*" + type_name(p.elem)
+  Type.Slice(s) => "[]" + type_name(s.elem)
+  Type.Map(m) => "map[" + type_name(m.key) + "]" + type_name(m.elem)
+  Type.Chan(c) => match c.dir {
+    ChanDir.Send => "chan<- " + type_name(c.elem)
+    ChanDir.Recv => "<-chan " + type_name(c.elem)
+    ChanDir.Both => "chan " + type_name(c.elem)
+  }
+  Type.Tuple(t) => "(" + t.elems.map(type_name).join(", ") + ")"
+}
+
+fn is_int(t: Type) -> Bool = match t {
+  Type.Int(i) => i.signed && (i.width == IntWidth.V64 || i.width == IntWidth.Platform)
+  _ => false
+}
+
+// The Ignite type of `t`, or why it has none.
+fn ty(w: W, t: Type) -> Result<Text, Text> = match t {
+  Type.Int(_) => if is_int(t) {
+    Ok("Int")
+  } else {
+    Err("an integer of type " + type_name(t) + ": Ignite's one integer type is Int, a signed 64-bit integer")
+  }
+  Type.Bool => Ok("Bool")
+  Type.String => Ok("Text")
+  Type.Error => Ok("Error")
+  Type.Unit => Ok("Unit")
+  Type.Any => Err("`any` outside a channel: Ignite has no top type")
+  Type.Named(n) => {
+    if decl(w, n.name) == None {
+      return Err("type " + n.name + " is not declared")
+    }
+    if has(w.refused, "type:" + n.name) {
+      return Err("type " + n.name + " is refused")
+    }
+    Ok(type_ident(n.name))
+  }
+  Type.Ptr(p) => if shared(w, t) {
+    Err("a pointer to " + type_name(p.elem) + ", which `shared` lists: Ignite has no shared mutable reference")
+  } else {
+    Err("a pointer to " + type_name(p.elem) + " outside a receiver or a result")
+  }
+  Type.Slice(s) => Ok("List<" + ty(w, s.elem)? + ">")
+  Type.Map(m) => {
+    if !ordered_key(w, m.key) {
+      return Err("a map keyed by " + type_name(m.key) + ": an Ignite map key is Int, Bool, Text or an enum without payloads")
+    }
+    Ok("Map<" + ty(w, m.key)? + ", " + ty(w, m.elem)? + ">")
+  }
+  Type.Chan(_) => Err("a channel: Ignite has no channel")
+  Type.Tuple(_) => Err("a tuple outside a result list")
+}
+
+fn ordered_key(w: W, t: Type) -> Bool = match t {
+  Type.Int(_) => is_int(t)
+  Type.Bool => true
+  Type.String => true
+  Type.Named(n) => match decl(w, n.name) {
+    Some(TypeDecl.Enum(_)) => true
+    Some(TypeDecl.Newtype(nt)) => ordered_key(w, nt.under) && match nt.under {
+      Type.Named(_) => false
+      _ => true
+    }
+    _ => false
+  }
+  _ => false
+}
+
+// A result type: a pointer to a type `shared` does not list is the value itself.
+fn result_ty(w: W, t: Type) -> Result<Text, Text> = match t {
+  Type.Ptr(p) => if shared(w, t) { ty(w, t) } else { ty(w, p.elem) }
+  _ => ty(w, t)
+}
+
+// Whether `==` compares two values of `t` as Go does.
+fn comparable(w: W, t: Type, seen: List<Text>) -> Bool = match t {
+  Type.Int(_) => true
+  Type.Bool => true
+  Type.String => true
+  Type.Named(n) => {
+    if has(seen, n.name) {
+      return true
+    }
+    var next = seen
+    next.push(n.name)
+    match decl(w, n.name) {
+      Some(TypeDecl.Struct(s)) => {
+        for f in s.fields {
+          if !comparable(w, f.t, next) {
+            return false
+          }
+        }
+        true
+      }
+      Some(TypeDecl.Newtype(nt)) => comparable(w, nt.under, next)
+      Some(TypeDecl.Enum(_)) => true
+      _ => false
+    }
+  }
+  _ => false
+}
+
+// Whether `<` and the other orderings compare two values of `t` as Go does.
+fn ordered(w: W, t: Type) -> Bool = match t {
+  Type.Int(_) => is_int(t)
+  Type.Named(n) => match decl(w, n.name) {
+    Some(TypeDecl.Newtype(nt)) => is_int(nt.under)
+    _ => false
+  }
+  _ => false
+}
+
+fn is_text(w: W, t: Type) -> Bool = match t {
+  Type.String => true
+  Type.Named(n) => match decl(w, n.name) {
+    Some(TypeDecl.Newtype(nt)) => is_text(w, nt.under)
+    _ => false
+  }
+  _ => false
+}
+
+fn is_int_like(w: W, t: Type) -> Bool = match t {
+  Type.Int(_) => is_int(t)
+  Type.Named(n) => match decl(w, n.name) {
+    Some(TypeDecl.Newtype(nt)) => is_int_like(w, nt.under)
+    _ => false
+  }
+  _ => false
+}
+
+// The zero value of `t`.
+fn zero(w: W, t: Type) -> Result<Text, Text> = match t {
+  Type.Int(_) => {
+    ty(w, t)?
+    Ok("0")
+  }
+  Type.Bool => Ok("false")
+  Type.String => Ok("\"\"")
+  Type.Unit => Ok("()")
+  Type.Slice(_) => {
+    ty(w, t)?
+    Ok("[]")
+  }
+  Type.Map(_) => {
+    ty(w, t)?
+    Ok("Map.empty()")
+  }
+  Type.Named(n) => {
+    ty(w, t)?
+    match decl(w, n.name) {
+      Some(TypeDecl.Struct(s)) => {
+        var fs: List<Text> = []
+        for f in s.fields {
+          fs.push(value_ident(f.name) + " = " + zero(w, f.t)?)
+        }
+        Ok(record(type_ident(n.name), fs))
+      }
+      Some(TypeDecl.Newtype(nt)) => zero(w, nt.under)
+      _ => Err("the zero value of " + n.name + ", which is none of its variants")
+    }
+  }
+  Type.Error => Err("a nil error outside an error result")
+  _ => Err("the zero value of " + type_name(t))
+}
+
+fn record(name: Text, fields: List<Text>) -> Text = if fields.is_empty() {
+  name + " " + r"{}"
+} else {
+  name + " " + r"{ " + fields.join(", ") + r" }"
+}
+
+// ---- declarations ------------------------------------------------------------------------
+
+fn type_decl(w: W, d: TypeDecl) -> Result<List<Text>, Text> = match d {
+  TypeDecl.Struct(s) => {
+    let name = type_ident(s.name)
+    var lines = comment(s.doc)
+    var seen: List<Text> = []
+    var fields: List<Text> = []
+    for f in s.fields {
+      let n = value_ident(f.name)
+      if has(seen, n) {
+        return Err("field " + f.name + " is written " + n + ", as another field is")
+      }
+      seen.push(n)
+      let t = match ty(w, f.t) {
+        Ok(t) => t
+        Err(reason) => return Err("field " + f.name + " of type " + type_name(f.t) + ": " + reason)
+      }
+      fields.push("  " + n + ": " + t)
+    }
+    if fields.is_empty() {
+      lines.push("type " + name + " " + r"{}")
+    } else {
+      lines.push("type " + name + " " + r"{")
+      lines.append(fields)
+      lines.push(r"}")
+    }
+    Ok(lines)
+  }
+  TypeDecl.Newtype(nt) => {
+    var lines = comment(nt.doc)
+    let under = match ty(w, nt.under) {
+      Ok(t) => t
+      Err(reason) => return Err("underlying type " + type_name(nt.under) + ": " + reason)
+    }
+    lines.push("type " + type_ident(nt.name) + " = " + under)
+    Ok(lines)
+  }
+  TypeDecl.Enum(e) => {
+    let name = type_ident(e.name)
+    let under = match e.under {
+      Type.String => "Text"
+      Type.Int(_) => if is_int(e.under) {
+        "Int"
+      } else {
+        return Err("an enum over " + type_name(e.under) + ": Ignite's one integer type is Int")
+      }
+      _ => return Err("an enum over neither a string nor an integer")
+    }
+    if e.variants.is_empty() {
+      return Err("an enum without variants")
+    }
+    var lines = comment(e.doc)
+    lines.push("enum " + name + " " + r"{")
+    var arms: List<Text> = []
+    var seen: List<Text> = []
+    for v in e.variants {
+      let vn = type_ident(v.name)
+      if has(seen, vn) || has(TAKEN_TYPES, vn) {
+        return Err("variant " + v.name + " is written " + vn + ", a name taken")
+      }
+      seen.push(vn)
+      lines.push("  " + vn)
+      let value = match v.value {
+        Expr.Lit(l) => if under == "Text" {
+          match go_string(l.value) {
+            Ok(text) => ignite_string(text)
+            Err(reason) => return Err("variant " + v.name + ": " + reason)
+          }
+        } else {
+          match go_int(l.value) {
+            Ok(n) => n.to_text()
+            Err(reason) => return Err("variant " + v.name + ": " + reason)
+          }
+        }
+        _ => return Err("variant " + v.name + " has no literal value")
+      }
+      arms.push("  " + name + "." + vn + " => " + value)
+    }
+    lines.push(r"}")
+    lines.push("")
+    lines.push("// The value the source gives each variant of " + name + ".")
+    lines.push("fn " + name + ".value(v: " + name + ") -> " + under + " = match v " + r"{")
+    lines.append(arms)
+    lines.push(r"}")
+    Ok(lines)
+  }
+  TypeDecl.Union(u) => {
+    var lines = comment(u.doc)
+    lines.push("enum " + type_ident(u.name) + " " + r"{")
+    for v in u.variants {
+      var ts: List<Text> = []
+      for f in v.fields {
+        ts.push(match ty(w, f.t) {
+          Ok(t) => t
+          Err(reason) => return Err("variant " + v.name + " field " + f.name + " of type " + type_name(f.t) + ": " + reason)
+        })
+      }
+      lines.push("  " + type_ident(v.name) + (if ts.is_empty() { "" } else { "(" + ts.join(", ") + ")" }))
+    }
+    lines.push(r"}")
+    Ok(lines)
+  }
+}
+
+fn const_decl(w: W, name: Text) -> Result<List<Text>, Text> {
+  for c in w.m.consts {
+    if c.name == name {
+      let value = match c.value {
+        Expr.Lit(l) => lit(w, l.value, c.t)?
+        _ => return Err("const " + name + ": a value that is not a literal")
+      }
+      let t = match c.t {
+        Type.String => "Text"
+        Type.Bool => "Bool"
+        Type.Int(_) => ty(w, c.t)?
+        _ => return Err("const " + name + ": a constant of a type other than string, integer or bool")
+      }
+      return Ok(["const " + const_ident(name) + ": " + t + " = " + value.text])
+    }
+  }
+  Err("layout names const " + name + ", which is not declared")
+}
+
+// ---- expressions -------------------------------------------------------------------------
+
+// An Ignite expression and the precedence of its outermost operator.
+type Ex {
+  text: Text
+  prec: Int
+}
+
+const ATOM: Int = 9
+const PREFIX: Int = 8
+const ADD: Int = 6
+const CMP: Int = 5
+const EQ: Int = 4
+const AND: Int = 3
+const OR: Int = 2
+const LOW: Int = 1
+
+fn atom(text: Text) -> Ex = Ex { text, prec = ATOM }
+
+// The text of `e`, in parentheses unless it binds at least as tightly as `p`.
+fn paren(e: Ex, p: Int) -> Text = if e.prec >= p { e.text } else { "(" + e.text + ")" }
+
+fn type_of(e: Expr) -> Type = match e {
+  Expr.Lit(x) => x.t
+  Expr.Nil(x) => x.t
+  Expr.Var(x) => x.t
+  Expr.Const(x) => x.t
+  Expr.Errvar(x) => x.t
+  Expr.Field(x) => x.t
+  Expr.Index(x) => x.t
+  Expr.Call(x) => x.t
+  Expr.Method(x) => x.t
+  Expr.Binop(x) => x.t
+  Expr.Unop(x) => x.t
+  Expr.Struct(x) => x.t
+  Expr.Conv(x) => x.t
+  Expr.Make(x) => x.t
+  Expr.Zero(x) => x.t
+  Expr.Intrinsic(x) => x.t
+  Expr.ToError(x) => x.t
+}
+
+fn lit(w: W, value: Text, t: Type) -> Result<Ex, Text> = match t {
+  Type.String => Ok(atom(ignite_string(go_string(value)?)))
+  Type.Bool => match value {
+    "true" => Ok(atom("true"))
+    "false" => Ok(atom("false"))
+    _ => Err("bool literal " + value)
+  }
+  Type.Int(_) => {
+    ty(w, t)?
+    Ok(atom(go_int(value)?.to_text()))
+  }
+  Type.Named(n) => match decl(w, n.name) {
+    Some(TypeDecl.Newtype(nt)) => {
+      ty(w, t)?
+      lit(w, value, nt.under)
+    }
+    _ => Err("a literal of type " + n.name)
+  }
+  _ => Err("a literal of type " + type_name(t))
+}
+
+// The writer inside one function.
+type Fx {
+  w: W
+  f: Func
+  shape: Shape
+  // The Go name of the receiver, "" without one, and its Ignite name.
+  recv: Text
+  recv_ident: Text
+  // The receiver after the call is returned first.
+  threads: Bool
+  // The Go names the body writes to.
+  mutated: List<Text>
+  // The body writes no slice or map element and appends to none.
+  no_element_writes: Bool
+}
+
+fn is_recv(fx: Fx, e: Expr) -> Bool = match e {
+  Expr.Var(v) => fx.recv != "" && v.name == fx.recv
+  _ => false
+}
+
+fn local(fx: Fx, name: Text) -> Text = if fx.recv != "" && name == fx.recv { fx.recv_ident } else { value_ident(name) }
+
+// A slice or map read from a variable is shared in Go and copied here.
+fn no_alias(fx: Fx, e: Expr) -> Result<Unit, Text> {
+  let container = match type_of(e) {
+    Type.Slice(_) => true
+    Type.Map(_) => true
+    _ => false
+  }
+  let place = match e {
+    Expr.Var(_) => true
+    Expr.Field(_) => true
+    Expr.Index(_) => true
+    _ => false
+  }
+  if container && place && !fx.no_element_writes {
+    return Err("a slice or map bound to a second name, which Go shares, in a function that writes a slice or map element")
+  }
+  Ok(())
+}
+
+fn val(fx: Fx, e: Expr) -> Result<Ex, Text> = match e {
+  Expr.Var(v) => {
+    if v.name == "_" {
+      return Err("a read of `_`")
+    }
+    Ok(atom(local(fx, v.name)))
+  }
+  Expr.Lit(l) => lit(fx.w, l.value, l.t)
+  Expr.Nil(n) => match n.t {
+    Type.Slice(_) => Ok(atom(zero(fx.w, n.t)?))
+    Type.Map(_) => Ok(atom(zero(fx.w, n.t)?))
+    _ => Err("nil of type " + type_name(n.t) + " outside an error result")
+  }
+  Expr.Const(c) => {
+    match c.t {
+      Type.Named(n) => match decl(fx.w, n.name) {
+        Some(TypeDecl.Enum(en)) => {
+          for v in en.variants {
+            if v.name == c.name {
+              ty(fx.w, c.t)?
+              return Ok(atom(type_ident(n.name) + "." + type_ident(c.name)))
+            }
+          }
+        }
+        _ => {}
+      }
+      _ => {}
+    }
+    for k in fx.w.m.consts {
+      if k.name == c.name {
+        return Ok(atom(const_ident(c.name)))
+      }
+    }
+    Err("constant " + c.name + " is not declared")
+  }
+  Expr.Errvar(_) => Err("an error value outside an error result")
+  Expr.ToError(_) => Err("an error value outside an error result")
+  Expr.Field(f) => Ok(atom(paren(val(fx, f.x)?, ATOM) + "." + value_ident(f.name)))
+  Expr.Index(i) => match type_of(i.x) {
+    Type.Map(m) => {
+      let z = zero(fx.w, m.elem)?
+      Ok(Ex { text = "match " + paren(val(fx, i.x)?, ATOM) + ".get(" + val(fx, i.index)?.text + ") " + r"{" + " Some(v) => v, None => " + z + " " + r"}", prec = LOW })
+    }
+    Type.Slice(_) => Ok(atom(paren(val(fx, i.x)?, ATOM) + "[" + val(fx, i.index)?.text + "]"))
+    t => Err("an index into " + type_name(t))
+  }
+  Expr.Call(c) => {
+    let callee = match function(fx.w, c.name) {
+      Some(f) => f
+      None => return Err("a call of " + c.name + ", which is not declared")
+    }
+    callable(fx, callee)?
+    Ok(atom(value_ident(c.name) + "(" + args(fx, c.args)?.join(", ") + ")"))
+  }
+  Expr.Method(m) => {
+    let xt = type_of(m.x)
+    if xt == Type.Error && m.name == "Error" && m.args.is_empty() {
+      return Ok(atom("Error.text(" + val(fx, m.x)?.text + ")"))
+    }
+    let key = recv_type_name(xt) + "." + m.name
+    let callee = match method(fx.w, key) {
+      Some(f) => f
+      None => return Err("a call of " + key + ", which is not declared")
+    }
+    callable(fx, callee)?
+    if threads(fx.w, key) {
+      return Err("a call of " + key + ", which writes its receiver, inside an expression")
+    }
+    var all = [val(fx, m.x)?.text]
+    all.append(args(fx, m.args)?)
+    Ok(atom(type_ident(recv_type_name(xt)) + "." + value_ident(m.name) + "(" + all.join(", ") + ")"))
+  }
+  Expr.Binop(b) => binop(fx, b.op, b.x, b.y)
+  Expr.Unop(u) => match u.op {
+    "!" => Ok(Ex { text = "!" + paren(val(fx, u.x)?, PREFIX), prec = PREFIX })
+    "+" => val(fx, u.x)
+    "-" => if is_int_like(fx.w, type_of(u.x)) {
+      Ok(atom("wrapping_sub(0, " + val(fx, u.x)?.text + ")"))
+    } else {
+      Err("unary - on " + type_name(type_of(u.x)))
+    }
+    "*" => match type_of(u.x) {
+      Type.Ptr(_) => if shared(fx.w, type_of(u.x)) {
+        Err("a dereference of " + type_name(type_of(u.x)) + ", which `shared` lists")
+      } else {
+        val(fx, u.x)
+      }
+      t => Err("a dereference of " + type_name(t))
+    }
+    op => Err("unary " + op + " on " + type_name(type_of(u.x)))
+  }
+  Expr.Struct(s) => {
+    let fields = match decl(fx.w, s.name) {
+      Some(TypeDecl.Struct(d)) => d.fields
+      _ => return Err("a struct literal of " + s.name + ", which is not a struct")
+    }
+    ty(fx.w, s.t)?
+    var fs: List<Text> = []
+    var given: List<Text> = []
+    for fi in s.fields {
+      fs.push(value_ident(fi.name) + " = " + val(fx, fi.value)?.text)
+      given.push(fi.name)
+    }
+    for d in fields {
+      if !has(given, d.name) {
+        fs.push(value_ident(d.name) + " = " + zero(fx.w, d.t)?)
+      }
+    }
+    Ok(atom(record(type_ident(s.name), fs)))
+  }
+  Expr.Conv(c) => {
+    match type_of(c.x) {
+      Type.Named(n) => if n.name == c.name {
+        return val(fx, c.x)
+      }
+      _ => {}
+    }
+    match decl(fx.w, c.name) {
+      Some(TypeDecl.Newtype(nt)) => {
+        ty(fx.w, c.t)?
+        if nt.under != type_of(c.x) {
+          return Err("a conversion of " + type_name(type_of(c.x)) + " to " + c.name + ", whose underlying type is " + type_name(nt.under))
+        }
+        val(fx, c.x)
+      }
+      _ => Err("a conversion to " + c.name + ", which is not a newtype")
+    }
+  }
+  Expr.Make(m) => match m.t {
+    Type.Slice(_) => Ok(atom(zero(fx.w, m.t)?))
+    Type.Map(_) => Ok(atom(zero(fx.w, m.t)?))
+    t => Err("make of " + type_name(t))
+  }
+  Expr.Zero(z) => Ok(atom(zero(fx.w, z.t)?))
+  Expr.Intrinsic(i) => match i.name {
+    "sprintf" => format(fx, i.args)
+    "len" => {
+      if i.args.len() != 1 {
+        return Err("len of other than one argument")
+      }
+      let x = i.args[0]
+      match type_of(x) {
+        Type.String => {}
+        Type.Slice(_) => {}
+        Type.Map(_) => {}
+        t => return Err("len of " + type_name(t))
+      }
+      Ok(atom(paren(val(fx, x)?, ATOM) + ".len()"))
+    }
+    "println" => Err("println: writing standard output is an effect a written function cannot declare")
+    name => Err(name + " outside the statement it belongs to")
+  }
+}
+
+fn callable(fx: Fx, callee: Func) -> Result<Unit, Text> {
+  let key = func_key(callee)
+  if has(fx.w.refused, "func:" + key) {
+    return Err("calls " + key + ", which is refused")
+  }
+  if has(fx.w.facts.fallible, key) || has(fx.w.facts.comma_ok, key) {
+    return Err("calls " + key + ", whose results are a Result or an Option")
+  }
+  Ok(())
+}
+
+fn args(fx: Fx, values: List<Expr>) -> Result<List<Text>, Text> {
+  var out: List<Text> = []
+  for a in values {
+    no_alias(fx, a)?
+    out.push(val(fx, a)?.text)
+  }
+  Ok(out)
+}
+
+fn binop(fx: Fx, op: Text, x: Expr, y: Expr) -> Result<Ex, Text> {
+  let w = fx.w
+  let xt = type_of(x)
+  let a = val(fx, x)?
+  let b = val(fx, y)?
+  match op {
+    "==" => {
+      if !comparable(w, xt, []) {
+        return Err(op + " on " + type_name(xt))
+      }
+      Ok(Ex { text = paren(a, EQ + 1) + " == " + paren(b, EQ + 1), prec = EQ })
+    }
+    "!=" => {
+      if !comparable(w, xt, []) {
+        return Err(op + " on " + type_name(xt))
+      }
+      Ok(Ex { text = paren(a, EQ + 1) + " != " + paren(b, EQ + 1), prec = EQ })
+    }
+    "<" => ordering(w, op, xt, a, b)
+    "<=" => ordering(w, op, xt, a, b)
+    ">" => ordering(w, op, xt, a, b)
+    ">=" => ordering(w, op, xt, a, b)
+    "&&" => Ok(Ex { text = paren(a, AND) + " && " + paren(b, AND + 1), prec = AND })
+    "||" => Ok(Ex { text = paren(a, OR) + " || " + paren(b, OR + 1), prec = OR })
+    "+" => if is_text(w, xt) {
+      Ok(Ex { text = paren(a, ADD) + " + " + paren(b, ADD + 1), prec = ADD })
+    } else if is_int_like(w, xt) {
+      Ok(atom("wrapping_add(" + a.text + ", " + b.text + ")"))
+    } else {
+      Err("binary + on " + type_name(xt))
+    }
+    "-" => if is_int_like(w, xt) {
+      Ok(atom("wrapping_sub(" + a.text + ", " + b.text + ")"))
+    } else {
+      Err("binary - on " + type_name(xt))
+    }
+    _ => Err("binary " + op + " on " + type_name(xt) + ": Go's integer operators wrap on overflow and Ignite's fail, and only + and - have a wrapping form here")
+  }
+}
+
+fn ordering(w: W, op: Text, t: Type, a: Ex, b: Ex) -> Result<Ex, Text> {
+  if is_text(w, t) {
+    return Err(op + " on " + type_name(t) + ": Ignite's Text has no ordering operator")
+  }
+  if !ordered(w, t) {
+    return Err(op + " on " + type_name(t))
+  }
+  Ok(Ex { text = paren(a, CMP + 1) + " " + op + " " + paren(b, CMP + 1), prec = CMP })
+}
+
+// Go `fmt.Sprintf` with the verbs `%s %v %d %t %%` and no flags: the parts joined with `+`.
+fn format(fx: Fx, values: List<Expr>) -> Result<Ex, Text> {
+  if values.is_empty() {
+    return Err("a format without arguments")
+  }
+  let text = match values[0] {
+    Expr.Lit(l) => if type_of(values[0]) == Type.String { go_string(l.value)? } else { return Err("a format that is not a string literal") }
+    _ => return Err("a format that is not a string literal")
+  }
+  let bytes = text.to_bytes()
+  var parts: List<Ex> = []
+  var plain = Bytes.empty()
+  var next = 1
+  var i = 0
+  while i < bytes.len() {
+    let c = bytes[i]
+    if c != b'%' {
+      plain.push(c)
+      i = i + 1
+      continue
+    }
+    if i + 1 >= bytes.len() {
+      return Err("a format ending in %")
+    }
+    let verb = bytes[i + 1]
+    i = i + 2
+    if verb == b'%' {
+      plain.push(b'%')
+      continue
+    }
+    if !(verb == b's' || verb == b'v' || verb == b'd' || verb == b't') {
+      return Err("format verb %" + Bytes.of([verb]).to_text() + ": only %s, %v, %d and %t without flags are written")
+    }
+    if next >= values.len() {
+      return Err("a format with more verbs than arguments")
+    }
+    if !plain.is_empty() {
+      parts.push(atom(ignite_string(plain.to_text())))
+      plain = Bytes.empty()
+    }
+    parts.push(shown(fx, values[next], verb)?)
+    next = next + 1
+  }
+  if next < values.len() {
+    return Err("a format with more arguments than verbs")
+  }
+  if !plain.is_empty() {
+    parts.push(atom(ignite_string(plain.to_text())))
+  }
+  if parts.is_empty() {
+    return Ok(atom("\"\""))
+  }
+  if parts.len() == 1 {
+    return Ok(parts[0])
+  }
+  var joined: List<Text> = []
+  var first = true
+  for p in parts {
+    joined.push(paren(p, if first { ADD } else { ADD + 1 }))
+    first = false
+  }
+  Ok(Ex { text = joined.join(" + "), prec = ADD })
+}
+
+// `e` as the text a Go verb prints for it.
+fn shown(fx: Fx, e: Expr, verb: Byte) -> Result<Ex, Text> {
+  let w = fx.w
+  let t = type_of(e)
+  let v = val(fx, e)?
+  let fits = |kind: Byte| verb == b'v' || verb == kind
+  let wrong = "%" + Bytes.of([verb]).to_text() + " on " + type_name(t)
+  match t {
+    Type.Int(_) => if is_int(t) && fits(b'd') { Ok(atom(paren(v, ATOM) + ".to_text()")) } else { Err(wrong) }
+    Type.Bool => if fits(b't') { Ok(atom(paren(v, ATOM) + ".to_text()")) } else { Err(wrong) }
+    Type.String => if fits(b's') { Ok(v) } else { Err(wrong) }
+    Type.Error => if fits(b's') { Ok(atom("Error.text(" + v.text + ")")) } else { Err(wrong) }
+    Type.Named(n) => {
+      if !displays(w, n.name) {
+        return Err(n.name + " formatted, but `displays` does not list it")
+      }
+      if !fits(b's') {
+        return Err(wrong)
+      }
+      ty(w, t)?
+      let tn = type_ident(n.name)
+      match decl(w, n.name) {
+        Some(TypeDecl.Newtype(nt)) => match nt.under {
+          Type.String => Ok(v)
+          Type.Int(_) => Ok(atom(paren(v, ATOM) + ".to_text()"))
+          Type.Bool => Ok(atom(paren(v, ATOM) + ".to_text()"))
+          _ => Err(n.name + " formatted, whose underlying type is not basic")
+        }
+        Some(TypeDecl.Enum(en)) => match en.under {
+          Type.String => Ok(atom(tn + ".value(" + v.text + ")"))
+          _ => Ok(atom(tn + ".value(" + v.text + ").to_text()"))
+        }
+        Some(TypeDecl.Struct(_)) => {
+          let via = if method(w, n.name + ".Error") != None { "Error" } else { "String" }
+          let key = n.name + "." + via
+          if method(w, key) == None || has(w.refused, "func:" + key) {
+            return Err(n.name + " formatted, but its method " + via + "() is not written")
+          }
+          Ok(atom(tn + "." + value_ident(via) + "(" + v.text + ")"))
+        }
+        _ => Err(n.name + " formatted")
+      }
+    }
+    _ => Err(type_name(t) + " formatted")
+  }
+}
+
+// The value of an error result.
+fn err_val(fx: Fx, e: Expr) -> Result<Text, Text> = match e {
+  Expr.Errvar(v) => {
+    for x in fx.w.m.errors {
+      if x.name == v.name {
+        return Ok("Error." + type_ident(v.name))
+      }
+    }
+    Err("sentinel error " + v.name + " is not declared")
+  }
+  Expr.ToError(t) => match type_of(t.x) {
+    Type.Named(n) => if is_error_struct(fx.w, n.name) {
+      Ok("Error." + type_ident(n.name) + "(" + val(fx, t.x)?.text + ")")
+    } else {
+      Err(n.name + " used as an error")
+    }
+    other => Err(type_name(other) + " used as an error")
+  }
+  Expr.Intrinsic(i) => if i.name == "errorf" {
+    Ok("Error.Msg(" + format(fx, i.args)?.text + ")")
+  } else {
+    Err("an error that is not a sentinel, an error type or errorf")
+  }
+  Expr.Var(v) => if type_of(e) == Type.Error { Ok(local(fx, v.name)) } else { Err("an error that is not a sentinel, an error type or errorf") }
+  _ => Err("an error that is not a sentinel, an error type or errorf")
+}
+
+// A returned value: `&T{…}` for an unshared `*T` result is the value.
+fn result_val(fx: Fx, e: Expr, t: Type) -> Result<Text, Text> {
+  match t {
+    Type.Ptr(_) => {
+      if shared(fx.w, t) {
+        return Err("a result of type " + type_name(t) + ", which `shared` lists")
+      }
+      return match e {
+        Expr.Unop(u) => if u.op == "&" { Ok(val(fx, u.x)?.text) } else { Err("a returned pointer that is not &T{{…}}") }
+        _ => Err("a returned pointer that is not &T{{…}}")
+      }
+    }
+    _ => {}
+  }
+  Ok(val(fx, e)?.text)
+}
+
+fn tuple(values: List<Text>) -> Text = match values.len() {
+  0 => "()"
+  1 => values[0]
+  _ => "(" + values.join(", ") + ")"
+}
+
+// The value a `return` gives, before the receiver is put in front; "" for none.
+fn returned(fx: Fx, results: List<Expr>) -> Result<Text, Text> {
+  let types = fx.f.results
+  if results.len() != types.len() {
+    return Err("a return of " + results.len().to_text() + " values from a function of " + types.len().to_text() + " results")
+  }
+  match fx.shape {
+    Shape.Plain => {
+      var vs: List<Text> = []
+      var i = 0
+      while i < results.len() {
+        vs.push(result_val(fx, results[i], types[i])?)
+        i = i + 1
+      }
+      Ok(if vs.is_empty() { "" } else { tuple(vs) })
+    }
+    Shape.Fallible => {
+      let last = results[results.len() - 1]
+      match last {
+        Expr.Nil(_) => {
+          var vs: List<Text> = []
+          var i = 0
+          while i < results.len() - 1 {
+            vs.push(result_val(fx, results[i], types[i])?)
+            i = i + 1
+          }
+          Ok("Ok(" + tuple(vs) + ")")
+        }
+        _ => Ok("Err(" + err_val(fx, last)? + ")")
+      }
+    }
+    Shape.CommaOk => match results[1] {
+      Expr.Lit(l) => match l.value {
+        "true" => Ok("Some(" + result_val(fx, results[0], types[0])? + ")")
+        "false" => Ok("None")
+        _ => Err("a comma-ok return whose flag is not a literal")
+      }
+      _ => Err("a comma-ok return whose flag is not a literal")
+    }
+  }
+}
+
+// `value` with the receiver in front where the function returns it.
+fn with_receiver(fx: Fx, value: Text) -> Text = if !fx.threads {
+  value
+} else if value.is_empty() {
+  fx.recv_ident
+} else {
+  "(" + fx.recv_ident + ", " + value + ")"
+}
+
+// ---- statements --------------------------------------------------------------------------
+
+fn stmt_pos(s: Stmt) -> Text = match s {
+  Stmt.Let(x) => x.pos
+  Stmt.Var(x) => x.pos
+  Stmt.Assign(x) => x.pos
+  Stmt.Incr(x) => x.pos
+  Stmt.Decr(x) => x.pos
+  Stmt.If(x) => x.pos
+  Stmt.ForRange(x) => x.pos
+  Stmt.Switch(x) => x.pos
+  Stmt.Return(x) => x.pos
+  Stmt.Expr(x) => x.pos
+  Stmt.Send(x) => x.pos
+  Stmt.LookupElse(x) => x.pos
+  Stmt.Foreign(x) => x.pos
+}
+
+fn at_pos<T>(r: Result<T, Text>, pos: Text) -> Result<T, Refuse> = match r {
+  Ok(v) => Ok(v)
+  Err(reason) => Err(Refuse { pos, reason })
+}
+
+fn block(fx: Fx, body: List<Stmt>) -> Result<List<Text>, Refuse> {
+  var out: List<Text> = []
+  for s in body {
+    out.append(stmt(fx, s)?)
+  }
+  Ok(out)
+}
+
+fn keyword(fx: Fx, name: Text) -> Text = if has(fx.mutated, name) { "var" } else { "let" }
+
+// Whether a struct literal appears in `e`, which the condition of `if` cannot parse.
+fn has_record(e: Expr) -> Bool = match e {
+  Expr.Struct(_) => true
+  Expr.Field(f) => has_record(f.x)
+  Expr.Index(i) => has_record(i.x) || has_record(i.index)
+  Expr.Binop(b) => has_record(b.x) || has_record(b.y)
+  Expr.Unop(u) => has_record(u.x)
+  Expr.Conv(c) => has_record(c.x)
+  Expr.ToError(t) => has_record(t.x)
+  Expr.Call(c) => any_record(c.args)
+  Expr.Intrinsic(i) => any_record(i.args)
+  Expr.Method(m) => has_record(m.x) || any_record(m.args)
+  _ => false
+}
+
+fn any_record(values: List<Expr>) -> Bool {
+  for v in values {
+    if has_record(v) {
+      return true
+    }
+  }
+  false
+}
+
+fn condition(fx: Fx, e: Expr) -> Result<Text, Text> {
+  let c = val(fx, e)?
+  Ok(if has_record(e) { "(" + c.text + ")" } else { c.text })
+}
+
+fn stmt(fx: Fx, s: Stmt) -> Result<List<Text>, Refuse> = match s {
+  Stmt.Let(x) => Ok([at_pos(let_stmt(fx, x.names, x.rhs), x.pos)?])
+  Stmt.Var(x) => {
+    let t = at_pos(ty(fx.w, x.t), x.pos)?
+    let z = at_pos(zero(fx.w, x.t), x.pos)?
+    Ok([keyword(fx, x.name) + " " + value_ident(x.name) + ": " + t + " = " + z])
+  }
+  Stmt.Assign(x) => at_pos(assign(fx, x.op, x.lhs, x.rhs), x.pos)
+  Stmt.Incr(x) => Ok([at_pos(step(fx, x.x, "wrapping_add"), x.pos)?])
+  Stmt.Decr(x) => Ok([at_pos(step(fx, x.x, "wrapping_sub"), x.pos)?])
+  Stmt.If(x) => if_stmt(fx, x.cond, x.then, x.else_, x.pos)
+  Stmt.ForRange(x) => {
+    let head = at_pos(range_head(fx, x.key, x.val, x.over, x.pos), x.pos)?
+    var lines = [head]
+    lines.append(indent(block(fx, x.body)?))
+    lines.push(r"}")
+    Ok(lines)
+  }
+  Stmt.Switch(x) => switch_stmt(fx, x.tag, x.cases, x.pos)
+  Stmt.Return(x) => {
+    let v = with_receiver(fx, at_pos(returned(fx, x.results), x.pos)?)
+    Ok([if v.is_empty() { "return" } else { "return " + v }])
+  }
+  Stmt.Expr(x) => Ok([at_pos(expr_stmt(fx, x.x), x.pos)?])
+  Stmt.Send(x) => Err(Refuse { pos = x.pos, reason = "a send on a channel: Ignite has no channel" })
+  Stmt.LookupElse(x) => {
+    let elem = match type_of(x.map) {
+      Type.Map(m) => m.elem
+      _ => return Err(Refuse { pos = x.pos, reason = "a lookup in something other than a map" })
+    }
+    let ends = match x.then.len() {
+      0 => false
+      n => match x.then[n - 1] {
+        Stmt.Return(_) => true
+        _ => false
+      }
+    }
+    if !ends {
+      return Err(Refuse { pos = x.pos, reason = "a lookup guard whose body does not end in a return" })
+    }
+    match elem {
+      Type.Slice(_) => if !fx.no_element_writes {
+        return Err(Refuse { pos = x.pos, reason = "a slice looked up from a map, which Go shares, in a function that writes a slice or map element" })
+      }
+      Type.Map(_) => if !fx.no_element_writes {
+        return Err(Refuse { pos = x.pos, reason = "a map looked up from a map, which Go shares, in a function that writes a slice or map element" })
+      }
+      _ => {}
+    }
+    let t = at_pos(ty(fx.w, elem), x.pos)?
+    let m = at_pos(val(fx, x.map), x.pos)?
+    let k = at_pos(val(fx, x.index), x.pos)?
+    let n = value_ident(x.name)
+    var lines = [keyword(fx, x.name) + " " + n + ": " + t + " = match " + paren(m, ATOM) + ".get(" + k.text + ") " + r"{", "  Some(" + n + ") => " + n, "  None => " + r"{"]
+    lines.append(indent(indent(block(fx, x.then)?)))
+    lines.push("  " + r"}")
+    lines.push(r"}")
+    Ok(lines)
+  }
+  Stmt.Foreign(x) => Err(Refuse { pos = x.pos, reason = "foreign " + x.lang + " statement: " + x.reason })
+}
+
+fn let_stmt(fx: Fx, names: List<Text>, rhs: List<Expr>) -> Result<Text, Text> {
+  if names.len() != 1 || rhs.len() != 1 {
+    return Err("a binding of " + names.len().to_text() + " names to " + rhs.len().to_text() + " values")
+  }
+  let e = rhs[0]
+  no_alias(fx, e)?
+  let v = val(fx, e)?
+  if names[0] == "_" {
+    return Ok("_ = " + v.text)
+  }
+  let t = ty(fx.w, type_of(e))?
+  Ok(keyword(fx, names[0]) + " " + value_ident(names[0]) + ": " + t + " = " + v.text)
+}
+
+// `e` as the target of a write: a variable or a field path from one.
+fn place(fx: Fx, e: Expr) -> Result<Text, Text> = match e {
+  Expr.Var(v) => if v.name == "_" { Err("a write to `_`") } else { Ok(local(fx, v.name)) }
+  Expr.Field(f) => Ok(place(fx, f.x)? + "." + value_ident(f.name))
+  Expr.Unop(u) => if u.op == "*" && is_recv(fx, u.x) { Ok(fx.recv_ident) } else { Err("a write through unary " + u.op) }
+  Expr.Index(i) => match type_of(i.x) {
+    Type.Slice(_) => Err("a write to a slice element: Ignite's List has no element assignment")
+    _ => Err("a write to a field of a map entry")
+  }
+  _ => Err("a write to something that is not a variable or a field")
+}
+
+fn assign(fx: Fx, op: Text, lhs: List<Expr>, rhs: List<Expr>) -> Result<List<Text>, Text> {
+  if lhs.len() != 1 || rhs.len() != 1 {
+    return Err("an assignment of more than one value")
+  }
+  let l = lhs[0]
+  let r = rhs[0]
+  match l {
+    Expr.Var(v) => if v.name == "_" {
+      return Ok(["_ = " + val(fx, r)?.text])
+    }
+    _ => {}
+  }
+  if op.is_empty() {
+    match r {
+      Expr.Intrinsic(i) => if i.name == "append" {
+        if i.args.is_empty() || i.args[0] != l {
+          return Err("append to a slice other than the one assigned")
+        }
+        let p = place(fx, l)?
+        var out: List<Text> = []
+        for a in i.args.slice(1, i.args.len()) {
+          no_alias(fx, a)?
+          out.push(p + ".push(" + val(fx, a)?.text + ")")
+        }
+        return Ok(out)
+      }
+      _ => {}
+    }
+  }
+  no_alias(fx, r)?
+  match l {
+    Expr.Index(i) => match type_of(i.x) {
+      Type.Map(_) => {
+        if !op.is_empty() {
+          return Err("a compound assignment to a map entry")
+        }
+        return Ok([place(fx, i.x)? + ".put(" + val(fx, i.index)?.text + ", " + val(fx, r)?.text + ")"])
+      }
+      _ => {}
+    }
+    _ => {}
+  }
+  let target = place(fx, l)?
+  let value = if op.is_empty() {
+    val(fx, r)?
+  } else if ends_with(op, "=") {
+    binop(fx, cut(op, 0, op.len() - 1), l, r)?
+  } else {
+    return Err("assignment operator " + op)
+  }
+  Ok([target + " = " + value.text])
+}
+
+fn step(fx: Fx, x: Expr, helper: Text) -> Result<Text, Text> {
+  if !is_int_like(fx.w, type_of(x)) {
+    return Err("++ or -- on a value that is not an integer")
+  }
+  let p = place(fx, x)?
+  Ok(p + " = " + helper + "(" + val(fx, x)?.text + ", 1)")
+}
+
+fn if_stmt(fx: Fx, cond: Expr, then: List<Stmt>, otherwise: List<Stmt>, pos: Text) -> Result<List<Text>, Refuse> {
+  let c = at_pos(condition(fx, cond), pos)?
+  var lines = ["if " + c + " " + r"{"]
+  lines.append(indent(block(fx, then)?))
+  if otherwise.is_empty() {
+    lines.push(r"}")
+    return Ok(lines)
+  }
+  let chained = otherwise.len() == 1 && match otherwise[0] {
+    Stmt.If(_) => true
+    _ => false
+  }
+  if chained {
+    let rest = stmt(fx, otherwise[0])?
+    lines.push(r"} else " + rest[0])
+    lines.append(rest.slice(1, rest.len()))
+    return Ok(lines)
+  }
+  lines.push(r"} else {")
+  lines.append(indent(block(fx, otherwise)?))
+  lines.push(r"}")
+  Ok(lines)
+}
+
+fn range_head(fx: Fx, key: Text, value: Text, over: Expr, pos: Text) -> Result<Text, Text> {
+  if (key != "_" && has(fx.mutated, key)) || (value != "_" && has(fx.mutated, value)) {
+    return Err("a loop variable the body writes")
+  }
+  let src = paren(val(fx, over)?, ATOM)
+  let k = value_ident(key)
+  let v = value_ident(value)
+  match type_of(over) {
+    Type.Map(_) => {
+      if !has(fx.w.facts.unordered_iteration, pos) {
+        return Err("a loop over a map that `unordered_iteration` does not list")
+      }
+      Ok("for (" + k + ", " + v + ") in " + src + " " + r"{")
+    }
+    Type.Slice(_) => if key == "_" {
+      Ok("for " + v + " in " + src + " " + r"{")
+    } else {
+      Err("a loop over a slice that binds its index")
+    }
+    t => Err("a loop over " + type_name(t))
+  }
+}
+
+fn switch_stmt(fx: Fx, tag: Option<Expr>, cases: List<Case>, pos: Text) -> Result<List<Text>, Refuse> {
+  var arms: List<(Text, List<Text>)> = []
+  var default: Option<List<Text>> = None
+  for c in cases {
+    let body = block(fx, c.body)?
+    if c.values.is_empty() {
+      default = Some(body)
+      continue
+    }
+    var conds: List<Text> = []
+    for v in c.values {
+      conds.push(at_pos(case_cond(fx, tag, v), pos)?)
+    }
+    arms.push((conds.join(" || "), body))
+  }
+  var lines: List<Text> = []
+  var first = true
+  for (cond, body) in arms {
+    lines.push((if first { "if " } else { r"} else if " }) + cond + " " + r"{")
+    lines.append(indent(body))
+    first = false
+  }
+  match default {
+    Some(body) => {
+      if first {
+        return Ok(body)
+      }
+      lines.push(r"} else {")
+      lines.append(indent(body))
+      lines.push(r"}")
+    }
+    None => if !first {
+      lines.push(r"}")
+    }
+  }
+  Ok(lines)
+}
+
+fn case_cond(fx: Fx, tag: Option<Expr>, value: Expr) -> Result<Text, Text> = match tag {
+  None => {
+    let c = val(fx, value)?
+    Ok(if has_record(value) { "(" + c.text + ")" } else { paren(c, OR + 1) })
+  }
+  Some(t) => {
+    match t {
+      Expr.Var(_) => {}
+      Expr.Const(_) => {}
+      Expr.Lit(_) => {}
+      Expr.Field(_) => {}
+      _ => return Err("a switch on a value that is not a variable, field, constant or literal")
+    }
+    if !comparable(fx.w, type_of(t), []) {
+      return Err("a switch on " + type_name(type_of(t)))
+    }
+    let text = paren(val(fx, t)?, EQ + 1) + " == " + paren(val(fx, value)?, EQ + 1)
+    Ok(if has_record(value) { "(" + text + ")" } else { text })
+  }
+}
+
+fn expr_stmt(fx: Fx, x: Expr) -> Result<Text, Text> = match x {
+  Expr.Call(c) => {
+    let v = val(fx, x)?
+    match c.t {
+      Type.Unit => Ok(v.text)
+      _ => Ok("_ = " + v.text)
+    }
+  }
+  Expr.Method(m) => {
+    let key = recv_type_name(type_of(m.x)) + "." + m.name
+    if !threads(fx.w, key) {
+      let v = val(fx, x)?
+      return match m.t {
+        Type.Unit => Ok(v.text)
+        _ => Ok("_ = " + v.text)
+      }
+    }
+    let callee = match method(fx.w, key) {
+      Some(f) => f
+      None => return Err("a call of " + key + ", which is not declared")
+    }
+    let k = func_key(callee)
+    if has(fx.w.refused, "func:" + k) {
+      return Err("calls " + k + ", which is refused")
+    }
+    let p = place(fx, m.x)?
+    var all = [p]
+    all.append(args(fx, m.args)?)
+    let call = type_ident(recv_type_name(type_of(m.x))) + "." + value_ident(m.name) + "(" + all.join(", ") + ")"
+    Ok(p + " = " + (if callee.results.is_empty() { call } else { call + ".0" }))
+  }
+  Expr.Intrinsic(i) => if i.name == "println" {
+    Err("println: writing standard output is an effect a written function cannot declare")
+  } else {
+    Err("an expression statement that is not a call")
+  }
+  _ => Err("an expression statement that is not a call")
+}
+
+// ---- walks -------------------------------------------------------------------------------
+
+fn root(e: Expr) -> Text = match e {
+  Expr.Var(v) => v.name
+  Expr.Field(f) => root(f.x)
+  Expr.Index(i) => root(i.x)
+  Expr.Unop(u) => if u.op == "*" { root(u.x) } else { "" }
+  _ => ""
+}
+
+// The Go names `body` writes to: assignments, `++`, `--`, and calls of methods that write
+// their receiver.
+fn mutated_names(w: W, body: List<Stmt>) -> List<Text> {
+  var out: List<Text> = []
+  for s in body {
+    match s {
+      Stmt.Assign(a) => {
+        for l in a.lhs {
+          out.push(root(l))
+        }
+      }
+      Stmt.Incr(i) => out.push(root(i.x))
+      Stmt.Decr(d) => out.push(root(d.x))
+      Stmt.Expr(x) => match x.x {
+        Expr.Method(m) => if threads(w, recv_type_name(type_of(m.x)) + "." + m.name) {
+          out.push(root(m.x))
+        }
+        _ => {}
+      }
+      Stmt.If(i) => {
+        out.append(mutated_names(w, i.then))
+        out.append(mutated_names(w, i.else_))
+      }
+      Stmt.ForRange(f) => out.append(mutated_names(w, f.body))
+      Stmt.Switch(sw) => {
+        for c in sw.cases {
+          out.append(mutated_names(w, c.body))
+        }
+      }
+      Stmt.LookupElse(l) => out.append(mutated_names(w, l.then))
+      _ => {}
+    }
+  }
+  out
+}
+
+// Whether `body` writes a slice or map element or appends to a slice.
+fn element_writes(body: List<Stmt>) -> Bool {
+  for s in body {
+    let found = match s {
+      Stmt.Assign(a) => {
+        var any = false
+        for l in a.lhs {
+          match l {
+            Expr.Index(_) => {
+              any = true
+            }
+            _ => {}
+          }
+        }
+        for r in a.rhs {
+          match r {
+            Expr.Intrinsic(i) => if i.name == "append" {
+              any = true
+            }
+            _ => {}
+          }
+        }
+        any
+      }
+      Stmt.If(i) => element_writes(i.then) || element_writes(i.else_)
+      Stmt.ForRange(f) => element_writes(f.body)
+      Stmt.Switch(sw) => {
+        var any = false
+        for c in sw.cases {
+          if element_writes(c.body) {
+            any = true
+          }
+        }
+        any
+      }
+      Stmt.LookupElse(l) => element_writes(l.then)
+      _ => false
+    }
+    if found {
+      return true
+    }
+  }
+  false
+}
+
+// The first `foreign` statement of `body`.
+fn foreign(body: List<Stmt>) -> Option<Refuse> {
+  for s in body {
+    let found = match s {
+      Stmt.Foreign(x) => Some(Refuse { pos = x.pos, reason = "foreign " + x.lang + " statement: " + x.reason })
+      Stmt.If(i) => match foreign(i.then) {
+        Some(r) => Some(r)
+        None => foreign(i.else_)
+      }
+      Stmt.ForRange(f) => foreign(f.body)
+      Stmt.Switch(sw) => {
+        var hit: Option<Refuse> = None
+        for c in sw.cases {
+          if hit == None {
+            hit = foreign(c.body)
+          }
+        }
+        hit
+      }
+      Stmt.LookupElse(l) => foreign(l.then)
+      _ => None
+    }
+    if found != None {
+      return found
+    }
+  }
+  None
+}
+
+// ---- functions ---------------------------------------------------------------------------
+
+fn func(w: W, f: Func) -> Result<List<Text>, Refuse> {
+  let pos = f.pos
+  let key = func_key(f)
+  match foreign(f.body) {
+    Some(r) => return Err(r)
+    None => {}
+  }
+  let refuse = |reason: Text| Refuse { pos, reason }
+  var recv = ""
+  var recv_ident = ""
+  var owner = ""
+  var threading = false
+  match f.recv {
+    Some(r) => {
+      let tn = recv_type_name(r.t)
+      if tn.is_empty() || decl(w, tn) == None {
+        return Err(refuse("a receiver of type " + type_name(r.t) + ", which is not a declared type"))
+      }
+      if has(w.refused, "type:" + tn) {
+        return Err(refuse("receiver of type " + type_name(r.t) + ": type " + tn + " is refused"))
+      }
+      if shared(w, r.t) {
+        return Err(refuse("receiver of type " + type_name(r.t) + ": a pointer to " + tn + ", which `shared` lists: Ignite has no shared mutable reference"))
+      }
+      match decl(w, tn) {
+        Some(TypeDecl.Enum(_)) => if snake(f.name) == "value" {
+          return Err(refuse("a method " + f.name + " of an enum, whose " + type_ident(tn) + ".value the writer declares"))
+        }
+        _ => {}
+      }
+      owner = type_ident(tn)
+      recv = if r.name.is_empty() { "_" } else { r.name }
+      recv_ident = if recv == "_" { "self" } else { value_ident(recv) }
+      threading = match r.t {
+        Type.Ptr(_) => !read_only(w, key)
+        _ => false
+      }
+    }
+    None => {
+      let n = value_ident(f.name)
+      if has(TAKEN_FNS, n) {
+        return Err(refuse("its name is written " + n + ", which Ignite or the writer declares"))
+      }
+      for c in w.m.consts {
+        if const_ident(c.name) == n {
+          return Err(refuse("its name is written " + n + ", as const " + c.name + " is"))
+        }
+      }
+    }
+  }
+  var params: List<Text> = []
+  if recv_ident != "" {
+    params.push(recv_ident + ": " + owner)
+  }
+  var seen: List<Text> = [recv_ident]
+  for p in f.params {
+    let t = match ty(w, p.t) {
+      Ok(t) => t
+      Err(reason) => return Err(refuse("parameter " + p.name + " of type " + type_name(p.t) + ": " + reason))
+    }
+    let n = if p.name == "_" || p.name.is_empty() { "_" + params.len().to_text() } else { value_ident(p.name) }
+    if has(seen, n) {
+      return Err(refuse("parameter " + p.name + " is written " + n + ", as another parameter is"))
+    }
+    seen.push(n)
+    params.push(n + ": " + t)
+  }
+  var shape = Shape.Plain
+  var base = ""
+  if has(w.facts.fallible, key) {
+    let n = f.results.len()
+    if n == 0 || f.results[n - 1] != Type.Error {
+      return Err(refuse("`fallible` lists it, but its last result is not an error"))
+    }
+    var ts: List<Text> = []
+    for t in f.results.slice(0, n - 1) {
+      ts.push(match result_ty(w, t) {
+        Ok(x) => x
+        Err(reason) => return Err(refuse("result of type " + type_name(t) + ": " + reason))
+      })
+    }
+    shape = Shape.Fallible
+    base = "Result<" + (if ts.is_empty() { "Unit" } else { tuple(ts) }) + ", Error>"
+  } else if has(w.facts.comma_ok, key) {
+    if f.results.len() != 2 || f.results[1] != Type.Bool {
+      return Err(refuse("`comma_ok` lists it, but its results are not (T, bool)"))
+    }
+    shape = Shape.CommaOk
+    base = "Option<" + (match result_ty(w, f.results[0]) {
+      Ok(x) => x
+      Err(reason) => return Err(refuse("result of type " + type_name(f.results[0]) + ": " + reason))
+    }) + ">"
+  } else {
+    var ts: List<Text> = []
+    for t in f.results {
+      if t == Type.Error {
+        return Err(refuse("an error result, but `fallible` does not list it"))
+      }
+      ts.push(match result_ty(w, t) {
+        Ok(x) => x
+        Err(reason) => return Err(refuse("result of type " + type_name(t) + ": " + reason))
+      })
+    }
+    base = if ts.is_empty() { "" } else { tuple(ts) }
+  }
+  let mutated = mutated_names(w, f.body)
+  let fx = Fx {
+    w, f, shape, recv, recv_ident, threads = threading, mutated,
+    no_element_writes = !element_writes(f.body)
+  }
+  let ret_type = if !threading {
+    base
+  } else if base.is_empty() {
+    owner
+  } else {
+    "(" + owner + ", " + base + ")"
+  }
+  let name = if owner.is_empty() { value_ident(f.name) } else { owner + "." + value_ident(f.name) }
+  var lines = comment(f.doc)
+  lines.push("fn " + name + "(" + params.join(", ") + ")" + (if ret_type.is_empty() { "" } else { " -> " + ret_type }) + " " + r"{")
+  if recv != "" && recv != "_" && (threading || has(mutated, recv)) {
+    lines.push("  var " + recv_ident + " = " + recv_ident)
+  }
+  for p in f.params {
+    if p.name != "_" && p.name != recv && has(mutated, p.name) {
+      lines.push("  var " + value_ident(p.name) + " = " + value_ident(p.name))
+    }
+  }
+  lines.append(indent(block(fx, f.body)?))
+  let ends_in_return = match f.body.len() {
+    0 => false
+    n => match f.body[n - 1] {
+      Stmt.Return(_) => true
+      _ => false
+    }
+  }
+  if threading && !ends_in_return {
+    lines.push("  " + recv_ident)
+  }
+  lines.push(r"}")
+  Ok(lines)
+}
+
+// ---- the module as a whole ---------------------------------------------------------------
+
+fn is_module_name(name: Text) -> Bool {
+  let b = name.to_bytes()
+  if b.is_empty() || !is_lower(b[0]) || has(KEYWORDS, name) {
+    return false
+  }
+  for c in b {
+    if !(is_lower(c) || is_digit(c) || c == b'_') {
+      return false
+    }
+  }
+  true
+}
+
+fn mentions_error(t: Type) -> Bool = match t {
+  Type.Error => true
+  Type.Ptr(p) => mentions_error(p.elem)
+  Type.Slice(s) => mentions_error(s.elem)
+  Type.Map(m) => mentions_error(m.key) || mentions_error(m.elem)
+  Type.Chan(c) => mentions_error(c.elem)
+  Type.Tuple(t) => {
+    for e in t.elems {
+      if mentions_error(e) {
+        return true
+      }
+    }
+    false
+  }
+  _ => false
+}
+
+fn find_decl(m: CirModule, name: Text) -> Option<TypeDecl> {
+  for d in m.types {
+    if decl_name(d) == name {
+      return Some(d)
+    }
+  }
+  None
+}
+
+fn find_func(m: CirModule, key: Text) -> Option<Func> {
+  for f in m.funcs {
+    if func_key(f) == key {
+      return Some(f)
+    }
+  }
+  None
+}
+
+fn find_const(m: CirModule, name: Text) -> Option<Text> {
+  for c in m.consts {
+    if c.name == name {
+      return Some(c.pos)
+    }
+  }
+  None
+}
+
+// `refusals` in the order of `keys`.
+fn ordered_refusals(refusals: List<Refusal>, keys: List<Text>) -> List<Refusal> {
+  var out: List<Refusal> = []
+  for k in keys {
+    for r in refusals {
+      if r.name == k {
+        out.push(r)
+      }
+    }
+  }
+  out
+}
+
+// Write `m` as one Ignite module, or say why it cannot be written at all.
+fn write(m: CirModule) -> Result<Written, Text> {
+  let facts = match m.facts {
+    Some(f) => f
+    None => return Err("module " + m.name + " has no facts: the `facts` pass has not run; run `codespec pass` over it first")
+  }
+  if !is_module_name(m.name) {
+    return Err("module name " + m.name + " is not a lowercase Ignite name, so it cannot end the package codespec." + m.name)
+  }
+  var type_names: List<Text> = []
+  for d in m.types {
+    let n = type_ident(decl_name(d))
+    if has(TAKEN_TYPES, n) {
+      return Err("type " + decl_name(d) + " is written " + n + ", which Ignite or the writer declares")
+    }
+    if has(type_names, n) {
+      return Err("type " + decl_name(d) + " is written " + n + ", as another type is")
+    }
+    type_names.push(n)
+  }
+  var w = W { m, facts, refused = [] }
+  var refusals: List<Refusal> = []
+  loop {
+    var more: List<Refusal> = []
+    for d in m.types {
+      let k = "type:" + decl_name(d)
+      if !has(w.refused, k) {
+        match type_decl(w, d) {
+          Ok(_) => {}
+          Err(reason) => more.push(Refusal { name = k, pos = decl_pos(d), reason })
+        }
+      }
+    }
+    if more.is_empty() {
+      break
+    }
+    for r in more {
+      w.refused.push(r.name)
+      refusals.push(r)
+    }
+  }
+  for c in m.consts {
+    match const_decl(w, c.name) {
+      Ok(_) => {}
+      Err(reason) => {
+        w.refused.push("const:" + c.name)
+        refusals.push(Refusal { name = "const:" + c.name, pos = c.pos, reason })
+      }
+    }
+  }
+  loop {
+    var more: List<Refusal> = []
+    for f in m.funcs {
+      let k = "func:" + func_key(f)
+      if !has(w.refused, k) {
+        match func(w, f) {
+          Ok(_) => {}
+          Err(r) => more.push(Refusal { name = k, pos = r.pos, reason = r.reason })
+        }
+      }
+    }
+    if more.is_empty() {
+      break
+    }
+    for r in more {
+      w.refused.push(r.name)
+      refusals.push(r)
+    }
+  }
+  var items: List<List<Text>> = []
+  var written_types: List<TypeDecl> = []
+  var written_funcs: List<Func> = []
+  for entry in m.layout {
+    match entry.strip_prefix("type:") {
+      Some(name) => if !has(w.refused, entry) {
+        match find_decl(m, name) {
+          Some(d) => {
+            items.push(type_decl(w, d)?)
+            written_types.push(d)
+          }
+          None => return Err("layout names type " + name + ", which is not declared")
+        }
+      }
+      None => {}
+    }
+    match entry.strip_prefix("const:") {
+      Some(name) => if !has(w.refused, entry) {
+        items.push(const_decl(w, name)?)
+      }
+      None => {}
+    }
+    match entry.strip_prefix("func:") {
+      Some(key) => if !has(w.refused, entry) {
+        match find_func(m, key) {
+          Some(f) => {
+            items.push(match func(w, f) {
+              Ok(lines) => lines
+              Err(r) => return Err("internal: func " + key + " refused after the fixed point: " + r.reason)
+            })
+            written_funcs.push(f)
+          }
+          None => return Err("layout names func " + key + ", which is not declared")
+        }
+      }
+      None => {}
+    }
+  }
+  let body = items.map(|lines| lines.join("\n")).join("\n\n")
+  var tail: List<List<Text>> = []
+  match error_enum(w, written_types, written_funcs, contains(body, "Error.Msg("))? {
+    Some(lines) => tail.push(lines)
+    None => {}
+  }
+  let sub = contains(body, "wrapping_sub(")
+  if sub || contains(body, "wrapping_add(") {
+    tail.push(WRAPPING_ADD)
+  }
+  if sub {
+    tail.push(WRAPPING_SUB)
+  }
+  var header = ["package codespec." + m.name, "", "// Code generated by codespec-write-ignite from cir/1. DO NOT EDIT."]
+  if !m.doc.is_empty() {
+    header.push("//")
+    header.append(comment(m.doc))
+  }
+  var parts = [header.join("\n")]
+  if !body.is_empty() {
+    parts.push(body)
+  }
+  for t in tail {
+    parts.push(t.join("\n"))
+  }
+  var keys: List<Text> = []
+  for d in m.types {
+    keys.push("type:" + decl_name(d))
+  }
+  for c in m.consts {
+    keys.push("const:" + c.name)
+  }
+  for f in m.funcs {
+    keys.push("func:" + func_key(f))
+  }
+  Ok(Written { source = parts.join("\n\n") + "\n", refusals = ordered_refusals(refusals, keys) })
+}
+
+// `enum Error` and `Error.text`, when the written module produces or names an error.
+fn error_enum(w: W, types: List<TypeDecl>, funcs: List<Func>, msg: Bool) -> Result<Option<List<Text>>, Text> {
+  var structs: List<Text> = []
+  for d in types {
+    if is_error_struct(w, decl_name(d)) {
+      structs.push(decl_name(d))
+    }
+  }
+  var typed = false
+  for d in types {
+    match d {
+      TypeDecl.Struct(s) => {
+        for f in s.fields {
+          if mentions_error(f.t) {
+            typed = true
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  for f in funcs {
+    for p in f.params {
+      if mentions_error(p.t) {
+        typed = true
+      }
+    }
+    for r in f.results {
+      if mentions_error(r) {
+        typed = true
+      }
+    }
+  }
+  if w.m.errors.is_empty() && structs.is_empty() && !msg && !typed {
+    return Ok(None)
+  }
+  var variants: List<Text> = []
+  var arms: List<Text> = []
+  var names: List<Text> = []
+  for e in w.m.errors {
+    let v = type_ident(e.name)
+    if has(names, v) {
+      return Err("sentinel error " + e.name + " is written Error." + v + ", as another error is")
+    }
+    names.push(v)
+    variants.push("  " + v)
+    arms.push("  Error." + v + " => " + ignite_string(e.message))
+  }
+  for s in structs {
+    if has(w.refused, "func:" + s + ".Error") {
+      return Err(s + ".Error is refused, so enum Error cannot give the text of " + s)
+    }
+    let v = type_ident(s)
+    if has(names, v) {
+      return Err("error type " + s + " is written Error." + v + ", as another error is")
+    }
+    names.push(v)
+    variants.push("  " + v + "(" + v + ")")
+    arms.push("  Error." + v + "(x) => " + v + ".error(x)")
+  }
+  if msg || variants.is_empty() {
+    if has(names, "Msg") {
+      return Err("an error is written Error.Msg, the variant of a formatted message")
+    }
+    variants.push("  Msg(Text)")
+    arms.push("  Error.Msg(text) => text")
+  }
+  var lines = [
+    "// Every error the module produces: its sentinel errors, its error types and `Msg` for a",
+    "// formatted message.",
+    "enum Error " + r"{"
+  ]
+  lines.append(variants)
+  lines.push(r"}")
+  lines.push("")
+  lines.push("// The text of an error, as Go's `Error()` gives it.")
+  lines.push("fn Error.text(e: Error) -> Text = match e " + r"{")
+  lines.append(arms)
+  lines.push(r"}")
+  Ok(Some(lines))
+}
+
+const WRAPPING_ADD: List<Text> = [
+  "// Go's integer addition, which wraps on overflow where Ignite's fails.",
+  "fn wrapping_add(a: Int, b: Int) -> Int " + r"{",
+  "  if b > 0 && a > 9223372036854775807 - b " + r"{",
+  "    return (a + (-9223372036854775808)) + (b + (-9223372036854775808))",
+  "  " + r"}",
+  "  if b < 0 && a < (-9223372036854775808) - b " + r"{",
+  "    return (a - (-9223372036854775808)) + (b - (-9223372036854775808))",
+  "  " + r"}",
+  "  a + b",
+  r"}"
+]
+
+const WRAPPING_SUB: List<Text> = [
+  "// Go's integer subtraction, which wraps on overflow where Ignite's fails.",
+  "fn wrapping_sub(a: Int, b: Int) -> Int " + r"{",
+  "  if b == -9223372036854775808 " + r"{",
+  "    return if a >= 0 " + r"{" + " a + (-9223372036854775808) " + r"}" + " else " + r"{" + " a - (-9223372036854775808) " + r"}",
+  "  " + r"}",
+  "  wrapping_add(a, -b)",
+  r"}"
+]
+
+// ---- tests -------------------------------------------------------------------------------
+
+test "names follow Ignite's conventions" {
+  assert snake("OrderID") == "order_id"
+  assert snake("PendingOrders") == "pending_orders"
+  assert snake("HTTPServer") == "http_server"
+  assert snake("seq") == "seq"
+  assert upper_camel("order_id") == "OrderId"
+  assert upper_camel("Ledger") == "Ledger"
+  assert value_ident("Type") == "type_"
+  assert const_ident("MaxItems") == "MAX_ITEMS"
+}
+
+test "Go string literals are decoded" {
+  assert go_string(r#""o-%d""#) == Ok("o-%d")
+  assert go_string(r#""a\tb\n\"\x41éé""#) == Ok("a\tb\n\"Aéé")
+  assert go_string("`raw\\n`") == Ok("raw\\n")
+  assert go_string(r#""\q""#) == Err(r#"string literal "\q""#)
+  assert go_string(r#""\xff""#) == Err(r#"string literal "\xff" is not UTF-8"#)
+}
+
+test "Go integer literals are decoded or refused" {
+  assert go_int("1_000") == Ok(1000)
+  assert go_int("0x1F") == Ok(31)
+  assert go_int("0o17") == Ok(15)
+  assert go_int("017") == Ok(15)
+  assert go_int("0b101") == Ok(5)
+  assert go_int("9223372036854775807") == Ok(9223372036854775807)
+  assert go_int("9223372036854775808") == Err("integer literal 9223372036854775808 overflows Int")
+}
+
+test "text becomes an Ignite string literal" {
+  assert ignite_string("a\"b{{c}}\\\n\u{1}") == "\"a\\\"b{{{{c}}}}\\\\\\n\\u{{1}}\""
+  assert ignite_string("") == "\"\""
+}
+
+test "refusals are listed as codespec-write-rust lists them" {
+  assert refusals_json([]) == "[]\n"
+  let one = refusals_json([Refusal { name = "func:F", pos = "m.go:3", reason = "a \"q\"" }])
+  assert one == "[\n  {{\n    \"name\": \"func:F\",\n    \"pos\": \"m.go:3\",\n    \"reason\": \"a \\\"q\\\"\"\n  }}\n]\n"
+  assert refusal_line(Refusal { name = "func:F", pos = "m.go:3", reason = "r" }) == r#"{"name":"func:F","pos":"m.go:3","reason":"r"}"#
+}
+
+const INT: Text = r#"{"k":"int","width":"64","signed":true}"#
+const STR: Text = r#"{"k":"string"}"#
+const BOOL_T: Text = r#"{"k":"bool"}"#
+
+test fn var_of(name: Text, t: Text) -> Text = r#"{"k":"var","name":""# + name + r#"","t":"# + t + r#"}"#
+
+test fn param(name: Text, t: Text) -> Text = r#"{"name":""# + name + r#"","t":"# + t + r#"}"#
+
+test fn ret(values: Text, pos: Text) -> Text = r#"{"k":"return","results":["# + values + r#"],"pos":""# + pos + r#""}"#
+
+// A function `name` at m.go:3 without a receiver.
+test fn func_of(name: Text, params: Text, results: Text, body: Text) -> Text =
+  r#"{"name":""# + name + r#"","exported":false,"params":["# + params + r#"],"results":["# + results + r#"],"body":["# + body + r#"],"pos":"m.go:3"}"#
+
+// A module `m` of `types` and `funcs` whose layout is `layout` and whose facts are `facts`.
+test fn module_of(types: Text, funcs: Text, layout: Text, facts: Text) -> Text =
+  r#"{"format":"cir/1","name":"m","reader":{"language":"go","name":"codespec-read-go","version":"0.0.0"},"types":["# +
+  types + r#"],"funcs":["# + funcs + r#"],"layout":["# + layout + r#"],"facts":"# + facts + r#"}"#
+
+const NO_FACTS: Text = r#"{"shared":[]}"#
+
+// The written source of `document`, or the reason it is refused whole.
+test fn source_of(document: Text) -> Text = match read(document) {
+  Ok(m) => match write(m) {
+    Ok(written) => written.source
+    Err(reason) => "refused: " + reason
+  }
+  Err(error) => "unread: " + error.describe()
+}
+
+// The refusals of `document` as `name pos: reason`.
+test fn refusals_of(document: Text) -> List<Text> = match read(document) {
+  Ok(m) => match write(m) {
+    Ok(written) => written.refusals.map(|r| r.name + " " + r.pos + ": " + r.reason)
+    Err(reason) => ["refused: " + reason]
+  }
+  Err(error) => ["unread: " + error.describe()]
+}
+
+test "a module without facts is refused whole" {
+  let document = r#"{"format":"cir/1","name":"m","reader":{"language":"go","name":"r","version":"0"},"types":[],"funcs":[],"layout":[]}"#
+  assert source_of(document) == "refused: module m has no facts: the `facts` pass has not run; run `codespec pass` over it first"
+}
+
+test "integer + and - wrap as Go's do" {
+  let add = r#"{"k":"binop","op":"+","x":"# + var_of("a", INT) + r#","y":"# + var_of("b", INT) + r#","t":"# + INT + r#"}"#
+  let f = func_of("Add", param("a", INT) + "," + param("b", INT), INT, ret(add, "m.go:4"))
+  let source = source_of(module_of("", f, r#""func:Add""#, NO_FACTS))
+  assert contains(source, "\n\nfn add(a: Int, b: Int) -> Int {{\n  return wrapping_add(a, b)\n}}\n\n")
+  assert contains(source, "fn wrapping_add(a: Int, b: Int) -> Int {{")
+  assert !contains(source, "fn wrapping_sub(")
+  assert source.starts_with("package codespec.m\n\n// Code generated by codespec-write-ignite from cir/1. DO NOT EDIT.\n\n")
+}
+
+test "a comparison Ignite's Text does not have is refused at its position" {
+  let less = r#"{"k":"binop","op":"<","x":"# + var_of("a", STR) + r#","y":"# + var_of("b", STR) + r#","t":"# + BOOL_T + r#"}"#
+  let f = func_of("Less", param("a", STR) + "," + param("b", STR), BOOL_T, ret(less, "m.go:4"))
+  let document = module_of("", f, r#""func:Less""#, NO_FACTS)
+  assert refusals_of(document) == ["func:Less m.go:4: < on string: Ignite's Text has no ordering operator"]
+  assert !contains(source_of(document), "fn less(")
+}
+
+test "a caller of a refused function is refused" {
+  let less = r#"{"k":"binop","op":"<","x":"# + var_of("a", STR) + r#","y":"# + var_of("b", STR) + r#","t":"# + BOOL_T + r#"}"#
+  let f = func_of("Less", param("a", STR) + "," + param("b", STR), BOOL_T, ret(less, "m.go:4"))
+  let call = r#"{"k":"call","name":"Less","args":["# + var_of("a", STR) + "," + var_of("a", STR) + r#"],"t":"# + BOOL_T + r#"}"#
+  let g = func_of("Same", param("a", STR), BOOL_T, ret(call, "m.go:7"))
+  assert refusals_of(module_of("", f + "," + g, r#""func:Less","func:Same""#, NO_FACTS)) == [
+    "func:Less m.go:4: < on string: Ignite's Text has no ordering operator",
+    "func:Same m.go:7: calls Less, which is refused"
+  ]
+}
+
+test "a map loop is written in key order only where unordered_iteration lists it" {
+  let map = r#"{"k":"map","key":"# + STR + r#","elem":"# + INT + r#"}"#
+  let loop_ = r#"{"k":"for_range","key":"k","val":"_","over":"# + var_of("m", map) + r#","body":[],"pos":"m.go:5"}"#
+  let f = func_of("Walk", param("m", map), "", loop_)
+  assert refusals_of(module_of("", f, r#""func:Walk""#, NO_FACTS)) == ["func:Walk m.go:5: a loop over a map that `unordered_iteration` does not list"]
+  let listed = r#"{"shared":[],"unordered_iteration":["m.go:5"]}"#
+  assert contains(source_of(module_of("", f, r#""func:Walk""#, listed)), "fn walk(m: Map<Text, Int>) {{\n  for (k, _) in m {{\n  }}\n}}")
+}
+
+test "a pointer to a shared type is refused, a channel too" {
+  let s = r#"{"k":"struct","name":"S","exported":true,"fields":[],"pos":"m.go:2"}"#
+  let ptr = r#"{"k":"ptr","elem":{"k":"named","name":"S"}}"#
+  let chan = r#"{"k":"chan","elem":{"k":"any"},"dir":"send"}"#
+  let f = func_of("Use", param("p", ptr), "", "")
+  let g = func_of("Send", param("c", chan), "", "")
+  let facts = r#"{"shared":["S"]}"#
+  assert refusals_of(module_of(s, f + "," + g, r#""type:S","func:Use","func:Send""#, facts)) == [
+    "func:Use m.go:3: parameter p of type *S: a pointer to S, which `shared` lists: Ignite has no shared mutable reference",
+    "func:Send m.go:3: parameter c of type chan<- any: a channel: Ignite has no channel"
+  ]
+}
+
+test "a comma-ok lookup is an Option" {
+  let map = r#"{"k":"map","key":"# + STR + r#","elem":"# + INT + r#"}"#
+  let miss = ret(r#"{"k":"lit","value":"0","t":"# + INT + r#"},{"k":"lit","value":"false","t":"# + BOOL_T + r#"}"#, "m.go:6")
+  let lookup = r#"{"k":"lookup_else","name":"v","map":"# + var_of("m", map) + r#","index":"# + var_of("k", STR) + r#","then":["# + miss + r#"],"pos":"m.go:5"}"#
+  let hit = ret(var_of("v", INT) + r#",{"k":"lit","value":"true","t":"# + BOOL_T + r#"}"#, "m.go:8")
+  let f = func_of("Get", param("m", map) + "," + param("k", STR), INT + "," + BOOL_T, lookup + "," + hit)
+  let facts = r#"{"shared":[],"comma_ok":["Get"]}"#
+  let expected = [
+    "fn get(m: Map<Text, Int>, k: Text) -> Option<Int> {{",
+    "  let v: Int = match m.get(k) {{",
+    "    Some(v) => v",
+    "    None => {{",
+    "      return None",
+    "    }}",
+    "  }}",
+    "  return Some(v)",
+    "}}"
+  ]
+  assert contains(source_of(module_of("", f, r#""func:Get""#, facts)), expected.join("\n"))
+}
+
+test "a method that writes its pointer receiver returns it" {
+  let c = r#"{"k":"struct","name":"Counter","exported":true,"fields":[{"name":"n","t":"# + INT + r#"}],"pos":"m.go:2"}"#
+  let ptr = r#"{"k":"ptr","elem":{"k":"named","name":"Counter"}}"#
+  let field = r#"{"k":"field","x":"# + var_of("c", ptr) + r#","name":"n","t":"# + INT + r#"}"#
+  let inc = r#"{"name":"Inc","exported":true,"recv":{"name":"c","t":"# + ptr + r#"},"params":[],"results":[],"body":[{"k":"incr","x":"# + field + r#","pos":"m.go:4"}],"pos":"m.go:3"}"#
+  let get = r#"{"name":"N","exported":true,"recv":{"name":"c","t":"# + ptr + r#"},"params":[],"results":["# + INT + r#"],"body":["# + ret(field, "m.go:6") + r#"],"pos":"m.go:5"}"#
+  let facts = r#"{"shared":[],"read_only":["Counter.N"]}"#
+  let source = source_of(module_of(c, inc + "," + get, r#""type:Counter","func:Counter.Inc","func:Counter.N""#, facts))
+  assert contains(source, "type Counter {{\n  n: Int\n}}\n\nfn Counter.inc(c: Counter) -> Counter {{\n  var c = c\n  c.n = wrapping_add(c.n, 1)\n  c\n}}\n\nfn Counter.n(c: Counter) -> Int {{\n  return c.n\n}}\n")
+}

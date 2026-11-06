@@ -7,3 +7,8 @@ run = ["{build}/original"]
 name = "reference"
 build = ["ignite", "build", "drivers/ignite/driver.ignite", "--out", "{build}/reference"]
 run = ["{build}/reference/bin/ledger-reference"]
+
+[[implementation]]
+name = "ignite"
+build = ["ignite", "build", "drivers/ignite-out/driver.ignite", "--out", "{build}/ignite"]
+run = ["{build}/ignite/bin/ledger-ignite"]
