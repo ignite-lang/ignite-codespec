@@ -16,6 +16,47 @@ tasks:
       - task: writer
       - task: reader
       - task: roundtrip
+      - task: roundtrip-adv
+
+  roundtrip-adv:
+    desc: Read examples/roundtrip-adv/source/probes.ignite, hand-written Ignite in the writer's forms whose Ignite meaning differs from cir/1's; the document validates as canonical and refuses each probe within its function
+    cmds:
+      - task: reader-adapter
+      - '{{.IGNITE}} test examples/roundtrip-adv/source/probes.ignite --out target/roundtrip-adv/test'
+      - mkdir -p target/roundtrip-adv/bin
+      - ln -sf "$(realpath "$(command -v {{.IGNITE}})")" target/roundtrip-adv/bin/ignite
+      - PATH="$PWD/target/roundtrip-adv/bin:$PATH" {{.CODESPEC}} read --lang ignite examples/roundtrip-adv/source/probes.ignite --out target/roundtrip-adv/probes.cir.json --adapters target/adapters
+      - '{{.CODESPEC}} validate --canonical target/roundtrip-adv/probes.cir.json'
+      - task: roundtrip-adv-shadow
+      - task: roundtrip-adv-loop
+      - task: roundtrip-adv-assign
+      - task: roundtrip-adv-unordered
+      - task: roundtrip-adv-stringer
+
+  roundtrip-adv-stringer:
+    desc: Status.value(s) of an enum with a String method, which Go's %s calls instead (probes.ignite:76), is refused
+    cmds:
+      - 'sed -n ''/"refusals"/,$p'' target/roundtrip-adv/probes.cir.json | grep -Eq ''"pos": "probes.ignite:7[3-6]"'''
+
+  roundtrip-adv-shadow:
+    desc: The receiver shadowed by a nested let and returned (probes.ignite:16-25) is refused
+    cmds:
+      - 'sed -n ''/"refusals"/,$p'' target/roundtrip-adv/probes.cir.json | grep -Eq ''"pos": "probes.ignite:(1[6-9]|2[0-5])"'''
+
+  roundtrip-adv-loop:
+    desc: The receiver shadowed by a loop variable and returned (probes.ignite:29-37) is refused
+    cmds:
+      - 'sed -n ''/"refusals"/,$p'' target/roundtrip-adv/probes.cir.json | grep -Eq ''"pos": "probes.ignite:(29|3[0-7])"'''
+
+  roundtrip-adv-assign:
+    desc: The whole receiver assigned (probes.ignite:41-45) is refused
+    cmds:
+      - 'sed -n ''/"refusals"/,$p'' target/roundtrip-adv/probes.cir.json | grep -Eq ''"pos": "probes.ignite:4[1-5]"'''
+
+  roundtrip-adv-unordered:
+    desc: A loop over an unordered that is not the identity (probes.ignite:49-60) is refused
+    cmds:
+      - 'sed -n ''/"refusals"/,$p'' target/roundtrip-adv/probes.cir.json | grep -Eq ''"pos": "probes.ignite:(49|5[0-9]|60)"'''
 
   roundtrip:
     desc: Read the writer's ledger examples/ledger/out/ignite/ledger.ignite as cir/1 without a refusal and write it again as Ignite; the output equals examples/ledger/out/roundtrip and checks silently, and reading and writing that output once more gives the same bytes

@@ -1,0 +1,92 @@
+package probesdriver.probes
+
+// Adversary cases of story ignite-round-trip: hand-written Ignite programs in the writer's
+// forms (`var r = r` methods, `unordered(m)`) whose Ignite meaning differs from the cir/1
+// meaning the reader gives them. Each function below must be refused by
+// `codespec-read-ignite`; `task roundtrip-adv` asserts a refusal for each. The inline test pins
+// the Ignite values.
+
+type Counter {
+  n: Int
+}
+
+// A method in the writer's form whose nested block declares its own `c` and returns it: in
+// Ignite the caller gets that new record; read as `return` of a pointer method, Go leaves the
+// receiver unchanged.
+fn Counter.reset_big(c: Counter) -> (Counter, Int) {
+  var c = c
+  if c.n > 10 {
+    let c = Counter { n = 0 }
+    let k = c.n
+    return (c, k)
+  }
+  c.n = c.n + 1
+  (c, c.n)
+}
+
+// A loop variable named as the receiver, returned from inside the loop: Ignite returns the
+// element, the cir/1 method returns nothing and leaves the receiver alone.
+fn Counter.pick(c: Counter, cs: List<Counter>) -> Counter {
+  var c = c
+  for c in cs {
+    if c.n > 5 {
+      return c
+    }
+  }
+  c
+}
+
+// The whole receiver replaced: Ignite returns the new record; cir/1's receiver is a pointer,
+// so assigning it rebinds a local in Go and the caller keeps the old value.
+fn Counter.zero(c: Counter, other: Counter) -> Counter {
+  var c = c
+  c = other
+  c
+}
+
+// An `unordered` that is not the writer's identity: it logs every call. The reader drops the
+// helper and reads the loop as a plain range, so the side effect is gone from cir/1.
+fn unordered<T>(m: T) -> T {
+  log("unordered called")
+  m
+}
+
+fn total(m: Map<Text, Int>) -> Int {
+  var s = 0
+  for (_, v) in unordered(m) {
+    s = s + v
+  }
+  s
+}
+
+enum Status {
+  Pending
+  Paid
+}
+
+fn Status.value(v: Status) -> Text = match v {
+  Status.Pending => "pending"
+  Status.Paid => "paid"
+}
+
+// A method that Go's `%s` calls in place of the value: `Status.value(s)` read as
+// `sprintf("%s", s)` prints "status" in Go where Ignite gives "pending".
+fn Status.String(v: Status) -> Text = "status"
+
+fn show(s: Status) -> Text = Status.value(s)
+
+test "the values Ignite gives" {
+  assert show(Status.Pending) == "pending"
+  assert Status.String(Status.Paid) == "status"
+  let big = Counter { n = 11 }
+  let (a, k) = Counter.reset_big(big)
+  assert a.n == 0 && k == 0
+  let one = Counter { n = 1 }
+  let b = Counter.pick(one, [Counter { n = 9 }])
+  assert b.n == 9
+  let z = Counter.zero(one, Counter { n = 7 })
+  assert z.n == 7
+  var m: Map<Text, Int> = Map.empty()
+  m.put("a", 2)
+  assert total(m) == 2
+}
